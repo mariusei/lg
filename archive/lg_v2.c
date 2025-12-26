@@ -1,0 +1,1734 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <pwd.h>
+#include <grp.h>
+#include <time.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <limits.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/wait.h>
+#include <math.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+
+#define INITIAL_CAPACITY 100
+#define MAX_PATH_SAFE 4096
+#define MAX_NAME_LEN 256
+#define HASH_TABLE_SIZE 1024  // Power of 2 for efficient modulo
+
+// Output detail levels
+typedef enum {
+    DETAIL_MINIMAL = 0,
+    DETAIL_STANDARD = 1,
+    DETAIL_FULL = 2
+} DetailLevel;
+
+// Output format types
+typedef enum {
+    FORMAT_NORMAL = 0,
+    FORMAT_JSON = 1,
+    FORMAT_PORCELAIN = 2
+} OutputFormat;
+
+typedef struct {
+    char *name;
+    mode_t mode;
+    off_t size;
+    time_t mtime;
+    uid_t uid;
+    gid_t gid;
+    char git_status;
+    int is_dir;
+    int is_exec;
+    int is_symlink;
+} FileInfo;
+
+typedef struct {
+    char *path;
+    char status_staged;
+    char status_unstaged;
+} GitStatus;
+
+// Hash table node for O(1) git status lookup
+typedef struct HashNode {
+    char *path;
+    char status_staged;
+    char status_unstaged;
+    struct HashNode *next;  // For collision handling via chaining
+} HashNode;
+
+typedef struct {
+    GitStatus *statuses;
+    size_t count;
+    size_t capacity;
+    char *rel_prefix;
+    HashNode **hash_table;  // Hash table for O(1) lookups
+} GitContext;
+
+typedef struct {
+    FileInfo *files;
+    size_t count;
+    size_t capacity;
+} FileList;
+
+// Global options
+static DetailLevel detail_level = DETAIL_MINIMAL;
+static OutputFormat output_format = FORMAT_NORMAL;
+static int show_all = 0;
+static int sort_alphabetical = 0;
+static int show_branch = 0;
+static int show_legend = 0;
+static int calc_dir_sizes = 0;
+static int group_by_type = 0;
+
+// Safe string functions
+static int safe_strncpy(char *dest, const char *src, size_t dest_size) {
+    if (!dest || !src || dest_size == 0) return -1;
+    
+    size_t src_len = strlen(src);
+    if (src_len >= dest_size) {
+        strncpy(dest, src, dest_size - 1);
+        dest[dest_size - 1] = '\0';
+        return -1; // Truncation occurred
+    }
+    
+    strcpy(dest, src);
+    return 0;
+}
+
+static int safe_path_join(char *dest, size_t dest_size, const char *dir, const char *file) {
+    int n = snprintf(dest, dest_size, "%s/%s", dir, file);
+    if (n < 0 || (size_t)n >= dest_size) {
+        return -1; // Error or truncation
+    }
+    return 0;
+}
+
+// Validate path to prevent traversal attacks
+static int validate_path(const char *path) {
+    if (!path || *path == '\0') return 0;
+
+    // Check path length
+    if (strlen(path) >= PATH_MAX) return 0;
+
+    // Canonicalize path - this resolves .., symlinks, etc.
+    // and validates the path exists and is accessible
+    char real[PATH_MAX];
+    if (!realpath(path, real)) return 0;
+
+    // Verify it's a directory
+    struct stat st;
+    if (stat(real, &st) != 0) return 0;
+    if (!S_ISDIR(st.st_mode)) return 0;
+
+    return 1;
+}
+
+// Format file size in human-readable format
+static void format_size(off_t size, char *buf, size_t buf_size) {
+    if (size < 1024) {
+        snprintf(buf, buf_size, "%4lldB", (long long)size);
+    } else if (size < 1024 * 1024) {
+        double kb = size / 1024.0;
+        snprintf(buf, buf_size, "%5.1fK", kb);
+    } else if (size < 1024 * 1024 * 1024) {
+        double mb = size / (1024.0 * 1024);
+        snprintf(buf, buf_size, "%5.1fM", mb);
+    } else {
+        double gb = size / (1024.0 * 1024 * 1024);
+        snprintf(buf, buf_size, "%5.1fG", gb);
+    }
+}
+
+// Initialize file list with dynamic allocation
+static FileList* filelist_create(void) {
+    FileList *list = malloc(sizeof(FileList));
+    if (!list) return NULL;
+    
+    list->capacity = INITIAL_CAPACITY;
+    list->count = 0;
+    list->files = calloc(list->capacity, sizeof(FileInfo));
+    
+    if (!list->files) {
+        free(list);
+        return NULL;
+    }
+    
+    return list;
+}
+
+// Add file to list with automatic resizing
+static int filelist_add(FileList *list, FileInfo *info) {
+    if (!list || !info) return -1;
+    
+    if (list->count >= list->capacity) {
+        size_t new_capacity = list->capacity * 2;
+        FileInfo *new_files = realloc(list->files, new_capacity * sizeof(FileInfo));
+        if (!new_files) return -1;
+        
+        list->files = new_files;
+        list->capacity = new_capacity;
+    }
+    
+    // Deep copy the file info
+    FileInfo *dest = &list->files[list->count];
+    dest->name = strdup(info->name);
+    if (!dest->name) return -1;
+    
+    dest->mode = info->mode;
+    dest->size = info->size;
+    dest->mtime = info->mtime;
+    dest->uid = info->uid;
+    dest->gid = info->gid;
+    dest->git_status = info->git_status;
+    dest->is_dir = info->is_dir;
+    dest->is_exec = info->is_exec;
+    dest->is_symlink = info->is_symlink;
+    
+    list->count++;
+    return 0;
+}
+
+// Free file list
+static void filelist_free(FileList *list) {
+    if (!list) return;
+    
+    for (size_t i = 0; i < list->count; i++) {
+        free(list->files[i].name);
+    }
+    free(list->files);
+    free(list);
+}
+
+// Simple string hash function (djb2 algorithm)
+static unsigned long hash_string(const char *str) {
+    unsigned long hash = 5381;
+    int c;
+
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+
+    return hash % HASH_TABLE_SIZE;
+}
+
+// Add entry to hash table
+static int hash_table_add(HashNode **table, const char *path, char status_staged, char status_unstaged) {
+    unsigned long index = hash_string(path);
+
+    // Create new node
+    HashNode *node = malloc(sizeof(HashNode));
+    if (!node) return -1;
+
+    node->path = strdup(path);
+    if (!node->path) {
+        free(node);
+        return -1;
+    }
+
+    node->status_staged = status_staged;
+    node->status_unstaged = status_unstaged;
+    node->next = table[index];  // Insert at front of chain
+    table[index] = node;
+
+    return 0;
+}
+
+// Lookup entry in hash table - O(1) average case
+static HashNode* hash_table_lookup(HashNode **table, const char *path) {
+    unsigned long index = hash_string(path);
+    HashNode *node = table[index];
+
+    // Walk the chain to find matching path
+    while (node != NULL) {
+        if (strcmp(node->path, path) == 0) {
+            return node;
+        }
+        node = node->next;
+    }
+
+    return NULL;
+}
+
+// Free hash table
+static void hash_table_free(HashNode **table) {
+    if (!table) return;
+
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        HashNode *node = table[i];
+        while (node != NULL) {
+            HashNode *next = node->next;
+            free(node->path);
+            free(node);
+            node = next;
+        }
+    }
+    free(table);
+}
+
+// Initialize git context
+static GitContext* git_context_create(void) {
+    GitContext *ctx = malloc(sizeof(GitContext));
+    if (!ctx) return NULL;
+
+    ctx->capacity = INITIAL_CAPACITY;
+    ctx->count = 0;
+    ctx->statuses = calloc(ctx->capacity, sizeof(GitStatus));
+    ctx->rel_prefix = NULL;
+    ctx->hash_table = calloc(HASH_TABLE_SIZE, sizeof(HashNode*));
+
+    if (!ctx->statuses || !ctx->hash_table) {
+        free(ctx->statuses);
+        free(ctx->hash_table);
+        free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+// Free git context
+static void git_context_free(GitContext *ctx) {
+    if (!ctx) return;
+
+    for (size_t i = 0; i < ctx->count; i++) {
+        free(ctx->statuses[i].path);
+    }
+    free(ctx->statuses);
+    free(ctx->rel_prefix);
+    hash_table_free(ctx->hash_table);
+    free(ctx);
+}
+
+// Execute git command safely using fork/exec instead of popen
+static int exec_git_command(const char *args[], char *output, size_t output_size) {
+    int pipefd[2];
+    pid_t pid;
+
+    if (pipe(pipefd) == -1) {
+        return -1;
+    }
+
+    pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+
+        // Redirect stderr to /dev/null to suppress git errors
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull != -1) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        close(pipefd[1]);
+
+        // Try multiple git locations
+        execvp("git", (char * const *)args);
+        // If we get here, exec failed
+        _exit(1);
+    }
+    
+    // Parent process
+    close(pipefd[1]);
+    
+    size_t total_read = 0;
+    ssize_t bytes_read;
+    while ((bytes_read = read(pipefd[0], output + total_read, 
+                              output_size - total_read - 1)) > 0) {
+        total_read += bytes_read;
+        if (total_read >= output_size - 1) break;
+    }
+    output[total_read] = '\0';
+    
+    close(pipefd[0]);
+    
+    int status;
+    waitpid(pid, &status, 0);
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+// Calculate directory sizes in batch using fork/exec instead of popen
+// This is much more efficient than calling du once per directory
+static int calculate_dir_sizes_batch(const char *base_path, FileList *files) {
+    if (!files || files->count == 0) return -1;
+
+    // Count directories and build argument list
+    size_t dir_count = 0;
+    for (size_t i = 0; i < files->count; i++) {
+        if (files->files[i].is_dir) {
+            dir_count++;
+        }
+    }
+
+    if (dir_count == 0) return 0;
+
+    // Allocate args array: "du" + "-sk" + all directory paths + NULL
+    char **args = malloc((dir_count + 3) * sizeof(char*));
+    if (!args) return -1;
+
+    args[0] = "du";
+    args[1] = "-sk";
+
+    // Build full paths for directories
+    char **dir_paths = malloc(dir_count * sizeof(char*));
+    if (!dir_paths) {
+        free(args);
+        return -1;
+    }
+
+    size_t arg_idx = 2;
+    for (size_t i = 0; i < files->count; i++) {
+        if (files->files[i].is_dir) {
+            char *full_path = malloc(PATH_MAX);
+            if (!full_path) {
+                // Cleanup on error
+                for (size_t j = 0; j < arg_idx - 2; j++) {
+                    free(dir_paths[j]);
+                }
+                free(dir_paths);
+                free(args);
+                return -1;
+            }
+
+            if (safe_path_join(full_path, PATH_MAX, base_path, files->files[i].name) != 0) {
+                free(full_path);
+                continue;
+            }
+
+            dir_paths[arg_idx - 2] = full_path;
+            args[arg_idx] = full_path;
+            arg_idx++;
+        }
+    }
+    args[arg_idx] = NULL;
+
+    // Fork and exec du with all directories
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        for (size_t i = 0; i < dir_count; i++) {
+            free(dir_paths[i]);
+        }
+        free(dir_paths);
+        free(args);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        for (size_t i = 0; i < dir_count; i++) {
+            free(dir_paths[i]);
+        }
+        free(dir_paths);
+        free(args);
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+
+        // Redirect stderr to /dev/null to suppress errors
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull != -1) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        close(pipefd[1]);
+
+        // Execute du with all directory paths
+        execvp("du", args);
+        // If we get here, exec failed
+        _exit(1);
+    }
+
+    // Parent process
+    close(pipefd[1]);
+
+    // Read all output (can be large with many directories)
+    size_t output_capacity = 65536;  // Start with 64KB
+    char *output = malloc(output_capacity);
+    if (!output) {
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+        for (size_t i = 0; i < dir_count; i++) {
+            free(dir_paths[i]);
+        }
+        free(dir_paths);
+        free(args);
+        return -1;
+    }
+
+    size_t total_read = 0;
+    ssize_t bytes_read;
+    while ((bytes_read = read(pipefd[0], output + total_read,
+                              output_capacity - total_read - 1)) > 0) {
+        total_read += bytes_read;
+        // Expand buffer if needed
+        if (total_read >= output_capacity - 1024) {
+            size_t new_capacity = output_capacity * 2;
+            char *new_output = realloc(output, new_capacity);
+            if (!new_output) break;
+            output = new_output;
+            output_capacity = new_capacity;
+        }
+    }
+    output[total_read] = '\0';
+
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    // Parse output and populate sizes
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        char *line = strtok(output, "\n");
+        while (line != NULL) {
+            long long size_kb = 0;
+            char path[PATH_MAX];
+
+            // Parse each line: "SIZE\tPATH"
+            if (sscanf(line, "%lld %[^\n]", &size_kb, path) == 2) {
+                // Find the matching file entry
+                for (size_t i = 0; i < files->count; i++) {
+                    if (files->files[i].is_dir) {
+                        char full_path[PATH_MAX];
+                        if (safe_path_join(full_path, sizeof(full_path),
+                                         base_path, files->files[i].name) == 0) {
+                            if (strcmp(full_path, path) == 0) {
+                                files->files[i].size = size_kb * 1024;  // Convert KB to bytes
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            line = strtok(NULL, "\n");
+        }
+    }
+
+    // Cleanup
+    free(output);
+    for (size_t i = 0; i < dir_count; i++) {
+        free(dir_paths[i]);
+    }
+    free(dir_paths);
+    free(args);
+
+    return 0;
+}
+
+// Calculate single directory size safely using fork/exec instead of popen
+// Used for the current directory "." entry
+static off_t calculate_dir_size_safe(const char *path) {
+    int pipefd[2];
+    pid_t pid;
+
+    if (pipe(pipefd) == -1) {
+        return 0;
+    }
+
+    pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 0;
+    }
+
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+
+        // Redirect stderr to /dev/null to suppress errors
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull != -1) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        close(pipefd[1]);
+
+        // Execute du with safe arguments (no shell interpretation)
+        const char *args[] = {"du", "-sk", path, NULL};
+        execvp("du", (char * const *)args);
+        // If we get here, exec failed
+        _exit(1);
+    }
+
+    // Parent process
+    close(pipefd[1]);
+
+    char output[256];
+    size_t total_read = 0;
+    ssize_t bytes_read;
+    while ((bytes_read = read(pipefd[0], output + total_read,
+                              sizeof(output) - total_read - 1)) > 0) {
+        total_read += bytes_read;
+        if (total_read >= sizeof(output) - 1) break;
+    }
+    output[total_read] = '\0';
+
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    // Parse output and return size in bytes
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        long long size_kb = 0;
+        if (sscanf(output, "%lld", &size_kb) == 1) {
+            return size_kb * 1024;  // Convert KB to bytes
+        }
+    }
+
+    return 0;  // Return 0 on failure
+}
+
+// Get git status using safe exec
+static GitContext* get_git_status(const char *dir_path) {
+    if (!validate_path(dir_path)) return NULL;
+    
+    GitContext *ctx = git_context_create();
+    if (!ctx) return NULL;
+    
+    char old_dir[PATH_MAX];
+    if (!getcwd(old_dir, sizeof(old_dir))) {
+        git_context_free(ctx);
+        return NULL;
+    }
+    
+    // Safely change to target directory
+    if (chdir(dir_path) != 0) {
+        git_context_free(ctx);
+        return NULL;
+    }
+    
+    // Get git root using safe exec
+    char git_root[PATH_MAX];
+    const char *args_root[] = {"git", "rev-parse", "--show-toplevel", NULL};
+    if (exec_git_command(args_root, git_root, sizeof(git_root)) != 0) {
+        chdir(old_dir);
+        git_context_free(ctx);
+        return NULL;
+    }
+    
+    // Remove newline
+    size_t len = strlen(git_root);
+    if (len > 0 && git_root[len-1] == '\n') {
+        git_root[len-1] = '\0';
+    }
+    
+    // Get current directory for relative path calculation
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        chdir(old_dir);
+        git_context_free(ctx);
+        return NULL;
+    }
+    
+    // Calculate relative prefix
+    if (strlen(cwd) > strlen(git_root)) {
+        size_t prefix_len = strlen(cwd + strlen(git_root) + 1);
+        ctx->rel_prefix = malloc(prefix_len + 2);  // +1 for '/', +1 for '\0'
+        if (ctx->rel_prefix) {
+            strcpy(ctx->rel_prefix, cwd + strlen(git_root) + 1);
+            if (strlen(ctx->rel_prefix) > 0) {
+                strcat(ctx->rel_prefix, "/");
+            }
+        }
+    }
+
+    // Change to git root so git status returns paths relative to root
+    if (chdir(git_root) != 0) {
+        chdir(old_dir);
+        git_context_free(ctx);
+        return NULL;
+    }
+
+    // Get git status using porcelain v2 for better parsing
+    const char *args_status[] = {"git", "status", "--porcelain=v2", NULL};
+    char status_output[65536]; // 64KB should be enough for most repos
+    
+    if (exec_git_command(args_status, status_output, sizeof(status_output)) == 0) {
+        // Parse porcelain v2 output
+        char *line = strtok(status_output, "\n");
+        while (line != NULL) {
+            if (line[0] == '1' || line[0] == '2') {
+                // Regular tracked file
+                char xy[3], path[PATH_MAX];
+                if (sscanf(line, "%*c %2s %*s %*s %*s %*s %*s %*s %1023s", xy, path) == 2) {
+                    // Add to git status list
+                    if (ctx->count >= ctx->capacity) {
+                        size_t new_cap = ctx->capacity * 2;
+                        GitStatus *new_statuses = realloc(ctx->statuses, 
+                                                         new_cap * sizeof(GitStatus));
+                        if (new_statuses) {
+                            ctx->statuses = new_statuses;
+                            ctx->capacity = new_cap;
+                        }
+                    }
+                    
+                    if (ctx->count < ctx->capacity) {
+                        ctx->statuses[ctx->count].path = strdup(path);
+                        ctx->statuses[ctx->count].status_staged = xy[0];
+                        ctx->statuses[ctx->count].status_unstaged = xy[1];
+
+                        // Add to hash table for O(1) lookup
+                        hash_table_add(ctx->hash_table, path, xy[0], xy[1]);
+
+                        ctx->count++;
+                    }
+                }
+            } else if (line[0] == '?') {
+                // Untracked file
+                char path[PATH_MAX];
+                if (sscanf(line, "? %1023s", path) == 1) {
+                    if (ctx->count < ctx->capacity) {
+                        ctx->statuses[ctx->count].path = strdup(path);
+                        ctx->statuses[ctx->count].status_staged = '?';
+                        ctx->statuses[ctx->count].status_unstaged = '?';
+
+                        // Add to hash table for O(1) lookup
+                        hash_table_add(ctx->hash_table, path, '?', '?');
+
+                        ctx->count++;
+                    }
+                }
+            }
+            line = strtok(NULL, "\n");
+        }
+    }
+    
+    chdir(old_dir);
+    return ctx;
+}
+
+// Check if a directory contains any files with git changes
+// Returns the most "urgent" status found (unstaged > staged > untracked)
+static char check_dir_for_changes(GitContext *ctx, const char *dir_path) {
+    if (!ctx || !dir_path) return ' ';
+
+    char prefix[PATH_MAX];
+    snprintf(prefix, sizeof(prefix), "%s/", dir_path);
+    size_t prefix_len = strlen(prefix);
+
+    char best_status = ' ';
+    int priority = 0;  // 0=none, 1=staged, 2=untracked, 3=unstaged
+
+    // Iterate through all git entries to find matches
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (strncmp(ctx->statuses[i].path, prefix, prefix_len) == 0) {
+            char status_staged = ctx->statuses[i].status_staged;
+            char status_unstaged = ctx->statuses[i].status_unstaged;
+
+            // Prioritize unstaged changes (most visible/urgent)
+            if (status_unstaged != '.' && status_unstaged != ' ') {
+                if (status_unstaged == '?') {
+                    if (priority < 2) {
+                        best_status = status_unstaged;
+                        priority = 2;
+                    }
+                } else {
+                    if (priority < 3) {
+                        best_status = tolower(status_unstaged);
+                        priority = 3;
+                    }
+                }
+            }
+            // Then staged changes
+            else if (status_staged != '.' && status_staged != ' ' && priority < 1) {
+                best_status = status_staged;
+                priority = 1;
+            }
+        }
+    }
+
+    return best_status;
+}
+
+// Get git status for a specific file - O(1) using hash table
+static char get_file_git_status(GitContext *ctx, const char *filename, int is_dir) {
+    if (!ctx || !filename) return ' ';
+
+    char full_path[PATH_MAX];
+    if (ctx->rel_prefix && strlen(ctx->rel_prefix) > 0) {
+        snprintf(full_path, sizeof(full_path), "%s%s", ctx->rel_prefix, filename);
+    } else {
+        safe_strncpy(full_path, filename, sizeof(full_path));
+    }
+
+    // O(1) hash table lookup instead of O(n) linear search
+    HashNode *node = hash_table_lookup(ctx->hash_table, full_path);
+
+    // If not found and it's a directory, try with trailing slash
+    // (git reports untracked directories with trailing /)
+    if (!node && is_dir) {
+        char path_with_slash[PATH_MAX];
+        snprintf(path_with_slash, sizeof(path_with_slash), "%s/", full_path);
+        node = hash_table_lookup(ctx->hash_table, path_with_slash);
+    }
+
+    if (node) {
+        // Return staged status if exists, otherwise unstaged
+        if (node->status_staged != '.' && node->status_staged != ' ') {
+            return node->status_staged;
+        }
+        if (node->status_unstaged != '.' && node->status_unstaged != ' ') {
+            // Return lowercase for unstaged
+            return tolower(node->status_unstaged);
+        }
+    }
+
+    // If directory and no direct match, check if it contains any changes
+    if (is_dir && node == NULL) {
+        return check_dir_for_changes(ctx, full_path);
+    }
+
+    return ' ';
+}
+
+// Get color for git status - muted colors to not distract from content
+static const char* get_git_color(char status) {
+    switch(status) {
+        case 'M': return "\033[38;5;214m";  // Orange (staged modified)
+        case 'm': return "\033[38;5;178m";  // Dimmed orange (unstaged)
+        case 'A': return "\033[38;5;34m";   // Muted green (staged add) - changed from bright
+        case 'a': return "\033[38;5;28m";   // Darker green (unstaged)
+        case 'D': return "\033[38;5;167m";  // Muted red (staged delete) - less bright
+        case 'd': return "\033[38;5;131m";  // Dimmed red (unstaged)
+        case 'R': return "\033[38;5;141m";  // Muted purple (renamed)
+        case 'r': return "\033[38;5;97m";   // Dimmed purple
+        case 'C': return "\033[38;5;73m";   // Muted cyan (copied)
+        case 'c': return "\033[38;5;66m";   // Dimmed cyan
+        case '?': return "\033[38;5;245m";  // Light gray (untracked) - slightly brighter
+        case '!': return "\033[38;5;240m";  // Dark gray (ignored)
+        default: return "";
+    }
+}
+
+// Format git status with symbol
+static void format_git_status(char status, char *buf, size_t buf_size) {
+    switch(status) {
+        case 'M': case 'A': case 'D': case 'R': case 'C':
+            snprintf(buf, buf_size, " ●"); // Staged
+            break;
+        case 'm': case 'a': case 'd': case 'r': case 'c':
+            snprintf(buf, buf_size, " ○"); // Unstaged
+            break;
+        case '?':
+            snprintf(buf, buf_size, " ?"); // Untracked
+            break;
+        case '!':
+            snprintf(buf, buf_size, " !"); // Ignored
+            break;
+        default:
+            snprintf(buf, buf_size, "  "); // Clean
+    }
+}
+
+// Get terminal width
+static int get_terminal_width(void) {
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
+        return w.ws_col;
+    }
+    return 80; // Default fallback
+}
+
+// Calculate visible length (excluding ANSI escape codes)
+static int visible_length(const char *str) {
+    int len = 0;
+    int in_escape = 0;
+
+    for (const char *p = str; *p; p++) {
+        if (*p == '\033') {
+            in_escape = 1;
+        } else if (in_escape && *p == 'm') {
+            in_escape = 0;
+        } else if (!in_escape) {
+            len++;
+        }
+    }
+
+    return len;
+}
+
+// Print string with wrapping at given indent level, preserving ANSI codes
+static void print_wrapped(const char *str, int indent, int max_width) {
+    if (!str) return;
+
+    int available = max_width - indent;
+    if (available <= 10) {  // Minimum reasonable width
+        printf("%s\n", str);
+        return;
+    }
+
+    int vis_len = visible_length(str);
+    if (vis_len <= available) {
+        printf("%s\n", str);
+        return;
+    }
+
+    // Wrap the string, tracking visible characters and preserving ANSI codes
+    int vis_count = 0;
+    int in_escape = 0;
+    const char *line_start = str;
+    const char *last_space = NULL;
+
+    for (const char *p = str; *p; p++) {
+        if (*p == '\033') {
+            in_escape = 1;
+        } else if (in_escape && *p == 'm') {
+            in_escape = 0;
+        } else if (!in_escape) {
+            if (*p == ' ') {
+                last_space = p;
+            }
+
+            vis_count++;
+
+            if (vis_count >= available) {
+                // Need to wrap - prefer breaking at space
+                const char *break_point = last_space ? last_space : p;
+
+                // Print line up to break point
+                printf("%.*s\n", (int)(break_point - line_start), line_start);
+
+                // Continue on next line with indent
+                printf("%*s", indent, "");
+
+                // Skip the space if we broke there
+                if (last_space && break_point == last_space) {
+                    line_start = last_space + 1;
+                } else {
+                    line_start = p;
+                }
+
+                vis_count = 0;
+                last_space = NULL;
+            }
+        }
+    }
+
+    // Print remaining part
+    if (*line_start) {
+        printf("%s\n", line_start);
+    } else {
+        printf("\n");
+    }
+}
+
+// Get file extension
+static const char* get_extension(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) return "";
+    return dot + 1;
+}
+
+// Comparison functions for sorting
+static int compare_name(const void *a, const void *b) {
+    const FileInfo *fa = (const FileInfo *)a;
+    const FileInfo *fb = (const FileInfo *)b;
+    return strcasecmp(fa->name, fb->name);
+}
+
+static int compare_time(const void *a, const void *b) {
+    const FileInfo *fa = (const FileInfo *)a;
+    const FileInfo *fb = (const FileInfo *)b;
+    return fa->mtime - fb->mtime;
+}
+
+// Comparison for grouping by type, then by time/name within each type
+static int compare_type_then_time(const void *a, const void *b) {
+    const FileInfo *fa = (const FileInfo *)a;
+    const FileInfo *fb = (const FileInfo *)b;
+
+    // Directories first
+    if (fa->is_dir != fb->is_dir) {
+        return fb->is_dir - fa->is_dir;
+    }
+
+    // Within same category (both dirs or both files), group by extension
+    if (!fa->is_dir) {
+        const char *ext_a = get_extension(fa->name);
+        const char *ext_b = get_extension(fb->name);
+        int ext_cmp = strcasecmp(ext_a, ext_b);
+        if (ext_cmp != 0) return ext_cmp;
+    }
+
+    // Within same type/extension, sort by time
+    return fa->mtime - fb->mtime;
+}
+
+static int compare_type_then_name(const void *a, const void *b) {
+    const FileInfo *fa = (const FileInfo *)a;
+    const FileInfo *fb = (const FileInfo *)b;
+
+    // Directories first
+    if (fa->is_dir != fb->is_dir) {
+        return fb->is_dir - fa->is_dir;
+    }
+
+    // Within same category, group by extension
+    if (!fa->is_dir) {
+        const char *ext_a = get_extension(fa->name);
+        const char *ext_b = get_extension(fb->name);
+        int ext_cmp = strcasecmp(ext_a, ext_b);
+        if (ext_cmp != 0) return ext_cmp;
+    }
+
+    // Within same type/extension, sort alphabetically
+    return strcasecmp(fa->name, fb->name);
+}
+
+// Print header based on detail level
+static void print_header(int show_git) {
+    switch (detail_level) {
+        case DETAIL_MINIMAL:
+            if (show_git) {
+                printf("   Size     Git  Modified     Name\n");
+                printf("────────────────────────────────────────\n");
+            } else {
+                printf("   Size     Modified     Name\n");
+                printf("──────────────────────────────────\n");
+            }
+            break;
+        case DETAIL_STANDARD:
+            if (show_git) {
+                printf("Permissions    Size   Git  Modified     Name                          Owner\n");
+                printf("──────────────────────────────────────────────────────────────────────────────\n");
+            } else {
+                printf("Permissions    Size   Modified     Name                          Owner\n");
+                printf("────────────────────────────────────────────────────────────────────────\n");
+            }
+            break;
+        case DETAIL_FULL:
+            if (show_git) {
+                printf("Mode       Size   Git  Owner            Group            Modified     Name\n");
+                printf("──────────────────────────────────────────────────────────────────────────────\n");
+            } else {
+                printf("Mode       Size   Owner            Group            Modified     Name\n");
+                printf("──────────────────────────────────────────────────────────────────────\n");
+            }
+            break;
+    }
+}
+
+// Print help message
+static void print_help(const char *prog_name) {
+    printf("Usage: %s [OPTIONS] [DIRECTORY]\n\n", prog_name);
+    printf("List directory contents with git status information.\n\n");
+    printf("Options:\n");
+    printf("  -a, --all          Show hidden files\n");
+    printf("  -n, --name         Sort alphabetically by name (default: by time)\n");
+    printf("  -t, --type         Group by file type with blank lines between groups\n");
+    printf("  -d, --dir-sizes    Calculate directory sizes (may be slow)\n");
+    printf("  -l                 Standard detail level (permissions, owner)\n");
+    printf("  -ll                Full detail level (octal mode, group)\n");
+    printf("  --json             Output in JSON format\n");
+    printf("  --porcelain        Machine-readable output\n");
+    printf("  --branch           Show current git branch\n");
+    printf("  --legend           Show git status legend\n");
+    printf("  -h, --help         Show this help message\n\n");
+    
+    printf("Git Status Symbols:\n");
+    printf("  [●] Staged changes    [○] Unstaged changes\n");
+    printf("  [?] Untracked files   [!] Ignored files\n\n");
+    
+    printf("Git Status Colors:\n");
+    printf("  Green  = Added        Orange = Modified\n");
+    printf("  Red    = Deleted      Pink   = Renamed\n");
+    printf("  Cyan   = Copied       Gray   = Untracked\n\n");
+    
+    printf("Permission Modes (octal):\n");
+    printf("  0755 = rwxr-xr-x (executable/directory)\n");
+    printf("  0644 = rw-r--r-- (regular file)\n");
+    printf("  0600 = rw------- (private file)\n");
+}
+
+/**
+ * Parse command-line arguments and determine directory path and file filters.
+ *
+ * Returns: 0 on success, 1 on error, 2 if help was shown (should exit cleanly)
+ */
+static int parse_arguments(int argc, char *argv[],
+                          const char **dir_path,
+                          char ***file_filters,
+                          int *filter_count,
+                          int *filters_are_files) {
+    *dir_path = ".";
+    *file_filters = NULL;
+    *filter_count = 0;
+    *filters_are_files = 0;
+
+    // Parse command line options
+    static struct option long_options[] = {
+        {"all", no_argument, 0, 'a'},
+        {"name", no_argument, 0, 'n'},
+        {"type", no_argument, 0, 't'},
+        {"dir-sizes", no_argument, 0, 'd'},
+        {"help", no_argument, 0, 'h'},
+        {"json", no_argument, 0, 'j'},
+        {"porcelain", no_argument, 0, 'p'},
+        {"branch", no_argument, 0, 'b'},
+        {"legend", no_argument, 0, 'L'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "antdlh", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'a':
+                show_all = 1;
+                break;
+            case 'n':
+                sort_alphabetical = 1;
+                break;
+            case 't':
+                group_by_type = 1;
+                break;
+            case 'd':
+                calc_dir_sizes = 1;
+                break;
+            case 'l':
+                if (detail_level == DETAIL_MINIMAL) {
+                    detail_level = DETAIL_STANDARD;
+                } else if (detail_level == DETAIL_STANDARD) {
+                    detail_level = DETAIL_FULL;
+                }
+                break;
+            case 'h':
+                print_help(argv[0]);
+                return 2;  // Special return code for help
+            case 'j':
+                output_format = FORMAT_JSON;
+                break;
+            case 'p':
+                output_format = FORMAT_PORCELAIN;
+                break;
+            case 'b':
+                show_branch = 1;
+                break;
+            case 'L':
+                show_legend = 1;
+                break;
+            default:
+                fprintf(stderr, "Usage: %s [-a] [-n] [-l] [-ll] [directory]\n", argv[0]);
+                return 1;
+        }
+    }
+
+    // Collect all remaining arguments
+    if (optind < argc) {
+        // Check if first argument is a directory
+        struct stat st;
+        if (stat(argv[optind], &st) == 0 && S_ISDIR(st.st_mode)) {
+            // It's a directory
+            *dir_path = argv[optind];
+            if (!validate_path(*dir_path)) {
+                fprintf(stderr, "Error: Invalid path\n");
+                return 1;
+            }
+            optind++;
+        }
+
+        // Collect file filters (either explicit files or patterns already expanded by shell)
+        if (optind < argc) {
+            *filter_count = argc - optind;
+            *file_filters = malloc(*filter_count * sizeof(char*));
+            if (!*file_filters) {
+                fprintf(stderr, "Error: Memory allocation failed\n");
+                return 1;
+            }
+
+            // Check if all arguments are existing files
+            *filters_are_files = 1;
+            for (int i = 0; i < *filter_count; i++) {
+                (*file_filters)[i] = argv[optind + i];
+
+                // Check if it's an existing file (not a directory)
+                struct stat file_st;
+                if (stat((*file_filters)[i], &file_st) == 0) {
+                    if (!S_ISREG(file_st.st_mode) && !S_ISLNK(file_st.st_mode)) {
+                        *filters_are_files = 0;
+                    }
+                } else {
+                    *filters_are_files = 0;
+                }
+            }
+
+            // If they're all files, extract directory and basenames
+            if (*filters_are_files && *filter_count > 0) {
+                // Use the directory of the first file
+                char *first_file = (*file_filters)[0];
+                char *last_slash = strrchr(first_file, '/');
+
+                if (last_slash != NULL) {
+                    // Extract directory
+                    size_t dir_len = last_slash - first_file;
+                    char *extracted_dir = malloc(dir_len + 1);
+                    if (extracted_dir) {
+                        strncpy(extracted_dir, first_file, dir_len);
+                        extracted_dir[dir_len] = '\0';
+                        *dir_path = extracted_dir;
+                    }
+
+                    // Convert full paths to basenames
+                    for (int i = 0; i < *filter_count; i++) {
+                        char *slash = strrchr((*file_filters)[i], '/');
+                        if (slash) {
+                            (*file_filters)[i] = slash + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Display git branch and legend if requested.
+ */
+static void show_git_info(GitContext *git_ctx) {
+    // Show branch if requested
+    if (show_branch && git_ctx) {
+        char branch[256];
+        const char *args[] = {"/usr/bin/git", "branch", "--show-current", NULL};
+        if (exec_git_command(args, branch, sizeof(branch)) == 0) {
+            size_t len = strlen(branch);
+            if (len > 0 && branch[len-1] == '\n') branch[len-1] = '\0';
+            printf("Branch: %s\n\n", branch);
+        }
+    }
+
+    // Show legend if requested
+    if (show_legend) {
+        printf("Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\n\n");
+    }
+}
+
+/**
+ * Collect files from directory into a FileList structure.
+ *
+ * Returns: FileList pointer on success, NULL on error
+ */
+static FileList* collect_files(const char *dir_path, GitContext *git_ctx,
+                               char **file_filters, int filter_count) {
+    FileList *files = filelist_create();
+    if (!files) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        return NULL;
+    }
+
+    // Read directory
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        perror(dir_path);
+        filelist_free(files);
+        return NULL;
+    }
+
+    // Add current directory entry when -d is used
+    if (calc_dir_sizes) {
+        struct stat st;
+        if (stat(dir_path, &st) == 0) {
+            FileInfo info;
+            info.name = strdup(".");
+            info.mode = st.st_mode;
+            info.size = st.st_size;
+            info.mtime = st.st_mtime;
+            info.uid = st.st_uid;
+            info.gid = st.st_gid;
+            info.is_dir = 1;
+            info.is_exec = 0;
+            info.is_symlink = 0;
+            info.git_status = ' ';  // Current dir doesn't have git status
+
+            // Calculate current directory size using safe fork/exec
+            info.size = calculate_dir_size_safe(dir_path);
+
+            filelist_add(files, &info);
+        }
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and .. when showing all files (we add . separately with -d)
+        if (entry->d_name[0] == '.' &&
+            (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)) {
+            continue;
+        }
+
+        if (!show_all && entry->d_name[0] == '.') {
+            continue;
+        }
+
+        // Apply file filters if provided
+        if (filter_count > 0) {
+            int match = 0;
+            for (int i = 0; i < filter_count; i++) {
+                if (strcmp(entry->d_name, file_filters[i]) == 0) {
+                    match = 1;
+                    break;
+                }
+            }
+            if (!match) {
+                continue;
+            }
+        }
+
+        char full_path[PATH_MAX];
+        if (safe_path_join(full_path, sizeof(full_path), dir_path, entry->d_name) != 0) {
+            continue;
+        }
+
+        struct stat st;
+        if (lstat(full_path, &st) == 0) {
+            FileInfo info;
+            info.name = entry->d_name;
+            info.mode = st.st_mode;
+            info.size = st.st_size;
+            info.mtime = st.st_mtime;
+            info.uid = st.st_uid;
+            info.gid = st.st_gid;
+            info.is_dir = S_ISDIR(st.st_mode);
+            info.is_exec = st.st_mode & S_IXUSR;
+            info.is_symlink = S_ISLNK(st.st_mode);
+            info.git_status = git_ctx ? get_file_git_status(git_ctx, entry->d_name, S_ISDIR(st.st_mode)) : ' ';
+
+            // Don't calculate directory sizes here - we'll do it in batch later
+            filelist_add(files, &info);
+        }
+    }
+    closedir(dir);
+
+    // Calculate all directory sizes in one batch (much faster than per-directory)
+    if (calc_dir_sizes) {
+        calculate_dir_sizes_batch(dir_path, files);
+    }
+
+    return files;
+}
+
+/**
+ * Sort files based on global options.
+ */
+static void sort_files(FileList *files) {
+    if (group_by_type) {
+        // Group by type, then sort within groups
+        if (sort_alphabetical) {
+            qsort(files->files, files->count, sizeof(FileInfo), compare_type_then_name);
+        } else {
+            qsort(files->files, files->count, sizeof(FileInfo), compare_type_then_time);
+        }
+    } else {
+        // Normal sorting
+        if (sort_alphabetical) {
+            qsort(files->files, files->count, sizeof(FileInfo), compare_name);
+        } else {
+            qsort(files->files, files->count, sizeof(FileInfo), compare_time);
+        }
+    }
+}
+
+/**
+ * Print files in JSON format.
+ */
+static void print_json_output(FileList *files) {
+    printf("[");
+    for (size_t i = 0; i < files->count; i++) {
+        if (i > 0) printf(",");
+        printf("\n  {\"name\":\"%s\",\"size\":%lld,\"mode\":\"%04o\",\"git\":\"%c\"}",
+               files->files[i].name, (long long)files->files[i].size,
+               files->files[i].mode & 07777, files->files[i].git_status);
+    }
+    printf("\n]\n");
+}
+
+/**
+ * Print files in porcelain (machine-readable) format.
+ */
+static void print_porcelain_output(FileList *files) {
+    for (size_t i = 0; i < files->count; i++) {
+        printf("%04o %lld %c %s\n",
+               files->files[i].mode & 07777,
+               (long long)files->files[i].size,
+               files->files[i].git_status,
+               files->files[i].name);
+    }
+}
+
+/**
+ * Print a single file entry in normal format.
+ */
+static void print_file_entry(FileInfo *f, size_t index, GitContext *git_ctx,
+                             int term_width, int has_files_with_size, int has_dirs_with_size,
+                             double min_log_size_file, double max_log_size_file,
+                             double min_log_size_dir, double max_log_size_dir) {
+    // Format various fields
+    char size_str[10];
+    if (f->is_dir && !calc_dir_sizes) {
+        strcpy(size_str, "     -");
+    } else {
+        format_size(f->size, size_str, sizeof(size_str));
+    }
+
+    char git_str[5];
+    format_git_status(f->git_status, git_str, sizeof(git_str));
+
+    struct tm *tm = localtime(&f->mtime);
+    char time_str[20];
+    strftime(time_str, sizeof(time_str), "%b %d %H:%M", tm);
+
+    const char *git_color = get_git_color(f->git_status);
+    const char *reset = git_color[0] ? "\033[0m" : "";
+
+    // Calculate size bar width (0-9 chars, with padding after text)
+    int bar_width = 0;
+    int is_dir_bar = 0;
+
+    if (f->is_dir && calc_dir_sizes && has_dirs_with_size && f->size > 0) {
+        // Directory bar (only when -d flag is set)
+        double log_size = log((double)f->size);
+        double normalized = 0;
+        if (max_log_size_dir > min_log_size_dir) {
+            normalized = (log_size - min_log_size_dir) / (max_log_size_dir - min_log_size_dir);
+        } else {
+            normalized = 1.0;
+        }
+        bar_width = 1 + (int)(normalized * 8);
+        if (bar_width > 9) bar_width = 9;
+        if (bar_width < 0) bar_width = 0;
+        is_dir_bar = 1;
+    } else if (!f->is_dir && has_files_with_size && f->size > 0) {
+        // File bar
+        double log_size = log((double)f->size);
+        double normalized = 0;
+        if (max_log_size_file > min_log_size_file) {
+            normalized = (log_size - min_log_size_file) / (max_log_size_file - min_log_size_file);
+        } else {
+            normalized = 1.0;
+        }
+        bar_width = 1 + (int)(normalized * 8);
+        if (bar_width > 9) bar_width = 9;
+        if (bar_width < 0) bar_width = 0;
+    }
+
+    // Format name with type indicators
+    char name_display[PATH_MAX + 10];
+    if (f->is_symlink) {
+        snprintf(name_display, sizeof(name_display), "\033[36m%s@\033[0m", f->name);
+    } else if (f->is_dir) {
+        snprintf(name_display, sizeof(name_display), "\033[34m%s/\033[0m", f->name);
+    } else if (f->is_exec) {
+        snprintf(name_display, sizeof(name_display), "\033[32m%s*\033[0m", f->name);
+    } else {
+        strcpy(name_display, f->name);
+    }
+
+    // Alternating date color
+    const char *date_color = (index % 2 == 0) ? "" : "\033[38;5;241m";
+    const char *date_reset = (index % 2 == 0) ? "" : "\033[0m";
+
+    // Print based on detail level
+    switch (detail_level) {
+        case DETAIL_MINIMAL:
+            if (bar_width > 0) {
+                char padded_size[10];
+                snprintf(padded_size, sizeof(padded_size), "%7s  ", size_str);
+
+                if (is_dir_bar) {
+                    printf("\033[100m\033[97m");
+                    for (int k = 0; k < bar_width; k++) {
+                        if (padded_size[k] == ' ') {
+                            printf("░");
+                        } else {
+                            printf("%c", padded_size[k]);
+                        }
+                    }
+                    printf("\033[0m%s  ", padded_size + bar_width);
+                } else {
+                    printf("\033[100m\033[97m%.*s\033[0m%s  ", bar_width, padded_size, padded_size + bar_width);
+                }
+
+                if (git_ctx) {
+                    printf("%s%s%s   ", git_color, git_str, reset);
+                }
+
+                printf("%s%-12s%s  ", date_color, time_str, date_reset);
+
+                int indent = 9 + 2 + (git_ctx ? 5 : 0) + 12 + 2;
+                print_wrapped(name_display, indent, term_width);
+            } else {
+                printf("%7s    ", size_str);
+                if (git_ctx) {
+                    printf("%s%s%s   ", git_color, git_str, reset);
+                }
+                printf("%s%-12s%s  ", date_color, time_str, date_reset);
+
+                int indent = 7 + 4 + (git_ctx ? 5 : 0) + 12 + 2;
+                print_wrapped(name_display, indent, term_width);
+            }
+            break;
+
+        case DETAIL_STANDARD: {
+            char perm_str[11];
+            snprintf(perm_str, sizeof(perm_str), "%c%c%c%c%c%c%c%c%c%c",
+                    f->is_dir ? 'd' : (f->is_symlink ? 'l' : '-'),
+                    f->mode & S_IRUSR ? 'r' : '-',
+                    f->mode & S_IWUSR ? 'w' : '-',
+                    f->mode & S_IXUSR ? 'x' : '-',
+                    f->mode & S_IRGRP ? 'r' : '-',
+                    f->mode & S_IWGRP ? 'w' : '-',
+                    f->mode & S_IXGRP ? 'x' : '-',
+                    f->mode & S_IROTH ? 'r' : '-',
+                    f->mode & S_IWOTH ? 'w' : '-',
+                    f->mode & S_IXOTH ? 'x' : '-');
+
+            struct passwd *pw = getpwuid(f->uid);
+            char owner[17];
+            if (pw && strlen(pw->pw_name) <= 16) {
+                strcpy(owner, pw->pw_name);
+            } else if (pw) {
+                strncpy(owner, pw->pw_name, 14);
+                strcpy(owner + 14, "~");
+            } else {
+                snprintf(owner, sizeof(owner), "%d", f->uid);
+            }
+
+            printf("%-10s ", perm_str);
+            if (bar_width > 0) {
+                char padded_size[10];
+                snprintf(padded_size, sizeof(padded_size), "%7s  ", size_str);
+
+                if (is_dir_bar) {
+                    printf("\033[100m\033[97m");
+                    for (int k = 0; k < bar_width; k++) {
+                        if (padded_size[k] == ' ') {
+                            printf("░");
+                        } else {
+                            printf("%c", padded_size[k]);
+                        }
+                    }
+                    printf("\033[0m%s  ", padded_size + bar_width);
+                } else {
+                    printf("\033[100m\033[97m%.*s\033[0m%s  ", bar_width, padded_size, padded_size + bar_width);
+                }
+            } else {
+                printf("%7s    ", size_str);
+            }
+
+            if (git_ctx) {
+                printf("%s%s%s   ", git_color, git_str, reset);
+            }
+
+            printf("%s%-12s%s  %-30s  %s\n", date_color, time_str, date_reset, name_display, owner);
+            break;
+        }
+
+        case DETAIL_FULL: {
+            char mode_str[8];
+            snprintf(mode_str, sizeof(mode_str), "%04o", f->mode & 07777);
+
+            struct passwd *pw = getpwuid(f->uid);
+            struct group *gr = getgrgid(f->gid);
+
+            char owner[17], group[17];
+            if (pw) {
+                strncpy(owner, pw->pw_name, 16);
+                owner[16] = '\0';
+            } else {
+                snprintf(owner, sizeof(owner), "%d", f->uid);
+            }
+
+            if (gr) {
+                strncpy(group, gr->gr_name, 16);
+                group[16] = '\0';
+            } else {
+                snprintf(group, sizeof(group), "%d", f->gid);
+            }
+
+            printf("%-7s ", mode_str);
+            if (bar_width > 0) {
+                char padded_size[10];
+                snprintf(padded_size, sizeof(padded_size), "%7s  ", size_str);
+
+                if (is_dir_bar) {
+                    printf("\033[100m\033[97m");
+                    for (int k = 0; k < bar_width; k++) {
+                        if (padded_size[k] == ' ') {
+                            printf("░");
+                        } else {
+                            printf("%c", padded_size[k]);
+                        }
+                    }
+                    printf("\033[0m%s  ", padded_size + bar_width);
+                } else {
+                    printf("\033[100m\033[97m%.*s\033[0m%s  ", bar_width, padded_size, padded_size + bar_width);
+                }
+            } else {
+                printf("%7s    ", size_str);
+            }
+
+            if (git_ctx) {
+                printf("%s%s%s   ", git_color, git_str, reset);
+            }
+
+            printf("%-16s %-16s %s%-12s%s  ", owner, group, date_color, time_str, date_reset);
+
+            int indent = 7 + 1 + 9 + 2 + (git_ctx ? 5 : 0) + 16 + 1 + 16 + 1 + 12 + 2;
+            print_wrapped(name_display, indent, term_width);
+            break;
+        }
+    }
+}
+
+/**
+ * Print files in normal (human-readable) format with visual enhancements.
+ */
+static void print_normal_output(FileList *files, GitContext *git_ctx) {
+    print_header(git_ctx != NULL);
+
+    // Get terminal width for wrapping
+    int term_width = get_terminal_width();
+
+    // Calculate log size range for visual bars - separate for files and dirs
+    double min_log_size_file = 0, max_log_size_file = 0;
+    double min_log_size_dir = 0, max_log_size_dir = 0;
+    int has_files_with_size = 0;
+    int has_dirs_with_size = 0;
+
+    for (size_t i = 0; i < files->count; i++) {
+        if (files->files[i].size > 0) {
+            double log_size = log((double)files->files[i].size);
+
+            if (files->files[i].is_dir) {
+                if (!has_dirs_with_size) {
+                    min_log_size_dir = max_log_size_dir = log_size;
+                    has_dirs_with_size = 1;
+                } else {
+                    if (log_size < min_log_size_dir) min_log_size_dir = log_size;
+                    if (log_size > max_log_size_dir) max_log_size_dir = log_size;
+                }
+            } else {
+                if (!has_files_with_size) {
+                    min_log_size_file = max_log_size_file = log_size;
+                    has_files_with_size = 1;
+                } else {
+                    if (log_size < min_log_size_file) min_log_size_file = log_size;
+                    if (log_size > max_log_size_file) max_log_size_file = log_size;
+                }
+            }
+        }
+    }
+
+    // Track previous file type for blank line insertion
+    const char *prev_ext = NULL;
+    int prev_was_dir = -1;
+
+    for (size_t i = 0; i < files->count; i++) {
+        FileInfo *f = &files->files[i];
+
+        // Insert blank line when type changes (if grouping by type)
+        if (group_by_type) {
+            const char *curr_ext = f->is_dir ? NULL : get_extension(f->name);
+
+            if (i > 0) {
+                // Check if we're switching categories
+                if (prev_was_dir != f->is_dir ||
+                    (!f->is_dir && prev_ext && curr_ext && strcasecmp(prev_ext, curr_ext) != 0)) {
+                    printf("\n");
+                }
+            }
+
+            // Update tracking variables
+            prev_ext = curr_ext;
+            prev_was_dir = f->is_dir;
+        }
+
+        print_file_entry(f, i, git_ctx, term_width, has_files_with_size, has_dirs_with_size,
+                        min_log_size_file, max_log_size_file, min_log_size_dir, max_log_size_dir);
+    }
+}
+
+/**
+ * Print files based on the selected output format.
+ */
+static void print_files(FileList *files, GitContext *git_ctx) {
+    switch (output_format) {
+        case FORMAT_JSON:
+            print_json_output(files);
+            break;
+        case FORMAT_PORCELAIN:
+            print_porcelain_output(files);
+            break;
+        case FORMAT_NORMAL:
+            print_normal_output(files, git_ctx);
+            break;
+    }
+}
+
+// Main function
+int main(int argc, char *argv[]) {
+    const char *dir_path;
+    char **file_filters;
+    int filter_count;
+    int filters_are_files;
+
+    // Parse command-line arguments
+    int parse_result = parse_arguments(argc, argv, &dir_path, &file_filters,
+                                       &filter_count, &filters_are_files);
+    if (parse_result != 0) {
+        return (parse_result == 2) ? 0 : 1;  // Return 0 if help was shown, 1 on error
+    }
+
+    // Get git status
+    GitContext *git_ctx = get_git_status(dir_path);
+
+    // Show git branch and legend if requested
+    show_git_info(git_ctx);
+
+    // Collect files from directory
+    FileList *files = collect_files(dir_path, git_ctx, file_filters, filter_count);
+    if (!files) {
+        git_context_free(git_ctx);
+        if (file_filters) free(file_filters);
+        return 1;
+    }
+
+    // Sort files based on options
+    sort_files(files);
+
+    // Print files in the requested format
+    print_files(files, git_ctx);
+
+    // Cleanup
+    filelist_free(files);
+    git_context_free(git_ctx);
+    if (file_filters) {
+        free(file_filters);
+    }
+
+    return 0;
+}

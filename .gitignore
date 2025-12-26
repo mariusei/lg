@@ -1,0 +1,37 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Zig dependencies (vendored locally)
+.zigdeps/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary test files
+test_*/
+tmp/
+
+# Internal planning/notes (not for release)
+.workplan/
+.cache/
+PHASE_*.md
+PERFORMANCE_ANALYSIS.md
+ZIG_API_REFERENCE.md
+FLAG_DESIGN.md
+LS_FEATURE_COMPARISON.md
+extract_graph_data.py
