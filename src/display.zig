@@ -3,13 +3,59 @@ const types = @import("types.zig");
 const colors = @import("colors.zig");
 const git = @import("git.zig");
 
+// libc is used to convert timestamps to the local timezone (matches `ls -l`),
+// including DST, via the system tz database.
+const c = @cImport({
+    @cInclude("time.h");
+    @cInclude("stdlib.h");
+});
+
 // Display configuration constants
-const STDOUT_BUFFER_SIZE = 4096;  // Match typical page size for efficient I/O
+const STDOUT_BUFFER_SIZE = 4096; // Match typical page size for efficient I/O
 const MIN_BAR_WIDTH: usize = 1;
 const MAX_BAR_WIDTH: usize = 9;
-const BAR_RANGE: usize = MAX_BAR_WIDTH - MIN_BAR_WIDTH;  // 8 characters of range
-const DIR_BAR_FILL = "░";  // U+2591 Light Shade for directory bars
-const DEFAULT_TERMINAL_WIDTH: usize = 80;  // Fallback if detection fails
+const BAR_RANGE: usize = MAX_BAR_WIDTH - MIN_BAR_WIDTH; // 8 characters of range
+const DIR_BAR_FILL = "░"; // U+2591 Light Shade for directory bars
+const DEFAULT_TERMINAL_WIDTH: usize = 80; // Fallback if detection fails
+
+/// Unified buffered output writer for consistent stdout handling
+/// Solves terminal emulator parsing issues by using single buffer/flush
+pub const UnifiedOutput = struct {
+    stdout: std.Io.File,
+    buffer: [STDOUT_BUFFER_SIZE]u8,
+    writer: std.Io.File.Writer,
+
+    /// Create unified output with configured buffer size
+    pub fn init(io: std.Io) UnifiedOutput {
+        var self = UnifiedOutput{
+            .stdout = std.Io.File.stdout(),
+            .buffer = undefined,
+            .writer = undefined,
+        };
+        self.writer = self.stdout.writer(io, &self.buffer);
+        return self;
+    }
+
+    /// Write formatted string
+    pub fn print(self: *UnifiedOutput, comptime fmt: []const u8, args: anytype) !void {
+        try self.writer.interface.print(fmt, args);
+    }
+
+    /// Write raw bytes
+    pub fn writeAll(self: *UnifiedOutput, data: []const u8) !void {
+        try self.writer.interface.writeAll(data);
+    }
+
+    /// Write newline
+    pub fn writeByte(self: *UnifiedOutput, byte: u8) !void {
+        try self.writer.interface.writeByte(byte);
+    }
+
+    /// Flush output (call once at end of complete output)
+    pub fn flush(self: *UnifiedOutput) !void {
+        try self.writer.interface.flush();
+    }
+};
 
 /// Calculate visual length of string (excluding ANSI escape codes).
 /// ANSI escape codes: ESC [ ... m (e.g., \x1b[38;5;214m)
@@ -71,16 +117,21 @@ fn getMetadataWidth(detail_level: types.DetailLevel, show_git: bool, show_inodes
 
 /// Main entry point for displaying files.
 pub fn print(
+    io: std.Io,
     allocator: std.mem.Allocator,
     files: []const types.FileInfo,
     git_ctx: ?*const git.GitContext,
     config: types.Config,
 ) !void {
+    var output = UnifiedOutput.init(io);
+
     switch (config.output_format) {
-        .normal => try printNormal(allocator, files, git_ctx, config),
-        .json => try printJson(files),
-        .porcelain => try printPorcelain(files),
+        .normal => try printNormal(allocator, files, git_ctx, config, &output),
+        .json => try printJson(files, &output),
+        .porcelain => try printPorcelain(files, &output),
     }
+
+    try output.flush();
 }
 
 /// Print files in human-readable format with colors.
@@ -89,12 +140,11 @@ fn printNormal(
     files: []const types.FileInfo,
     git_ctx: ?*const git.GitContext,
     config: types.Config,
+    output: *UnifiedOutput,
 ) !void {
-    const stdout = std.fs.File.stdout();
-
     // Print header (skip in one-column mode)
     if (!config.one_column) {
-        try printHeader(stdout, config, git_ctx != null);
+        try printHeader(config, git_ctx != null, output);
     }
 
     // Calculate size statistics for visual bars
@@ -127,11 +177,7 @@ fn printNormal(
             }
 
             if (should_insert_blank) {
-                var stdout_buffer: [STDOUT_BUFFER_SIZE]u8 = undefined;
-                var stdout_writer = stdout.writer(&stdout_buffer);
-                const writer = &stdout_writer.interface;
-                try writer.writeAll("\n");
-                try writer.flush();
+                try output.writeAll("\n");
             }
 
             // Update tracking variables
@@ -141,42 +187,42 @@ fn printNormal(
 
         try printFileEntry(
             allocator,
-            stdout,
             file,
             i,
             config.detail_level,
             git_ctx != null,
             size_stats,
             config,
+            output,
         );
     }
 }
 
 /// Print header based on detail level.
-fn printHeader(stdout: std.fs.File, config: types.Config, show_git: bool) !void {
-    var stdout_buffer: [STDOUT_BUFFER_SIZE]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buffer);
-    const writer = &stdout_writer.interface;
-
+fn printHeader(
+    config: types.Config,
+    show_git: bool,
+    output: *UnifiedOutput,
+) !void {
     const inode_col = if (config.show_inodes) "  Inode  " else "";
 
     switch (config.detail_level) {
         .minimal => {
             if (show_git) {
-                try writer.print("{s}   Size     Git  Modified     Name\n", .{inode_col});
-                try writer.writeAll("────────────────────────────────────────────────────────────\n");
+                try output.print("{s}   Size     Git  Modified     Name\n", .{inode_col});
+                try output.writeAll("────────────────────────────────────────────────────────────\n");
             } else {
-                try writer.print("{s}   Size     Modified     Name\n", .{inode_col});
-                try writer.writeAll("──────────────────────────────────\n");
+                try output.print("{s}   Size     Modified     Name\n", .{inode_col});
+                try output.writeAll("──────────────────────────────────\n");
             }
         },
         .standard => {
             if (show_git) {
-                try writer.print("{s}Permissions    Size   Git  Modified     Name                          Owner\n", .{inode_col});
-                try writer.writeAll("────────────────────────────────────────────────────────────────────────────────────────\n");
+                try output.print("{s}Permissions    Size   Git  Modified     Name                          Owner\n", .{inode_col});
+                try output.writeAll("────────────────────────────────────────────────────────────────────────────────────────\n");
             } else {
-                try writer.print("{s}Permissions    Size   Modified     Name                          Owner\n", .{inode_col});
-                try writer.writeAll("──────────────────────────────────────────────────────────────────────────────────\n");
+                try output.print("{s}Permissions    Size   Modified     Name                          Owner\n", .{inode_col});
+                try output.writeAll("──────────────────────────────────────────────────────────────────────────────────\n");
             }
         },
         .full => {
@@ -184,18 +230,17 @@ fn printHeader(stdout: std.fs.File, config: types.Config, show_git: bool) !void 
                 // Build owner/group header dynamically based on -o/-g flags
                 const owner_col = if (config.omit_owner) "" else "Owner            ";
                 const group_col = if (config.omit_group) "" else "Group            ";
-                try writer.print("{s}Mode       Size   Git  {s}{s}Modified     Name\n", .{ inode_col, owner_col, group_col });
-                try writer.writeAll("────────────────────────────────────────────────────────────────────────────────────────\n");
+                try output.print("{s}Mode       Size   Git  {s}{s}Modified     Name\n", .{ inode_col, owner_col, group_col });
+                try output.writeAll("────────────────────────────────────────────────────────────────────────────────────────\n");
             } else {
                 // Build owner/group header dynamically based on -o/-g flags
                 const owner_col = if (config.omit_owner) "" else "Owner            ";
                 const group_col = if (config.omit_group) "" else "Group            ";
-                try writer.print("{s}Mode       Size   {s}{s}Modified     Name\n", .{ inode_col, owner_col, group_col });
-                try writer.writeAll("──────────────────────────────────────────────────────────────────────────────────\n");
+                try output.print("{s}Mode       Size   {s}{s}Modified     Name\n", .{ inode_col, owner_col, group_col });
+                try output.writeAll("──────────────────────────────────────────────────────────────────────────────────\n");
             }
         },
     }
-    try writer.flush();
 }
 
 const SizeStats = struct {
@@ -251,25 +296,19 @@ fn calculateSizeStats(files: []const types.FileInfo) SizeStats {
 
 fn printFileEntry(
     allocator: std.mem.Allocator,
-    stdout: std.fs.File,
     file: types.FileInfo,
     index: usize,
     detail: types.DetailLevel,
     show_git: bool,
     stats: SizeStats,
     config: types.Config,
+    output: *UnifiedOutput,
 ) !void {
-
-    var stdout_buffer: [STDOUT_BUFFER_SIZE]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buffer);
-    const writer = &stdout_writer.interface;
-
     // One column mode: just print the name and return
     if (config.one_column) {
         const name_display = try formatName(allocator, file, config);
         defer allocator.free(name_display);
-        try writer.print("{s}\n", .{name_display});
-        try writer.flush();
+        try output.print("{s}\n", .{name_display});
         return;
     }
 
@@ -326,7 +365,7 @@ fn printFileEntry(
         .minimal => {
             // Print inode if requested
             if (config.show_inodes) {
-                try writer.print("{d:>9} ", .{file.inode});
+                try output.print("{d:>9} ", .{file.inode});
             }
 
             if (bar_width > 0) {
@@ -337,42 +376,42 @@ fn printFileEntry(
                 // Render visual bar with size overlaid
                 if (is_dir_bar) {
                     // Directory bars use box drawing characters
-                    try writer.writeAll("\x1b[100m\x1b[97m");
+                    try output.writeAll("\x1b[100m\x1b[97m");
                     for (formatted[0..bar_width]) |ch| {
                         if (ch == ' ') {
-                            try writer.writeAll("░");
+                            try output.writeAll("░");
                         } else {
-                            try writer.writeByte(ch);
+                            try output.writeByte(ch);
                         }
                     }
-                    try writer.writeAll("\x1b[0m");
-                    try writer.writeAll(formatted[bar_width..]);
+                    try output.writeAll("\x1b[0m");
+                    try output.writeAll(formatted[bar_width..]);
                 } else {
                     // File bars are solid background
-                    try writer.print("\x1b[100m\x1b[97m{s}\x1b[0m{s}", .{
+                    try output.print("\x1b[100m\x1b[97m{s}\x1b[0m{s}", .{
                         formatted[0..bar_width],
                         formatted[bar_width..],
                     });
                 }
             } else {
-                try writer.print("{s:>7}     ", .{size_str});
+                try output.print("{s:>7}     ", .{size_str});
             }
 
             if (show_git) {
-                try writer.print("{s}{s}{s}   ", .{ git_color, git_symbol, reset });
+                try output.print("{s}{s}{s}   ", .{ git_color, git_symbol, reset });
             }
-            try writer.print("{s}{s}{s}  {s}\n", .{ date_color, time_str, date_reset, name_display });
+            try output.print("{s}{s}{s}  {s}\n", .{ date_color, time_str, date_reset, name_display });
         },
         .standard => {
             // Print inode if requested
             if (config.show_inodes) {
-                try writer.print("{d:>9} ", .{file.inode});
+                try output.print("{d:>9} ", .{file.inode});
             }
 
             const perm_str = try formatPermissions(allocator, file);
             defer allocator.free(perm_str);
 
-            try writer.print("{s} ", .{perm_str});
+            try output.print("{s} ", .{perm_str});
 
             if (bar_width > 0) {
                 // Create padded size string for bar overlay (7 chars + 3 spaces = 10)
@@ -382,43 +421,43 @@ fn printFileEntry(
                 // Render visual bar with size overlaid
                 if (is_dir_bar) {
                     // Directory bars use box drawing characters
-                    try writer.writeAll("\x1b[100m\x1b[97m");
+                    try output.writeAll("\x1b[100m\x1b[97m");
                     for (formatted[0..bar_width]) |ch| {
                         if (ch == ' ') {
-                            try writer.writeAll("░");
+                            try output.writeAll("░");
                         } else {
-                            try writer.writeByte(ch);
+                            try output.writeByte(ch);
                         }
                     }
-                    try writer.writeAll("\x1b[0m");
-                    try writer.writeAll(formatted[bar_width..]);
+                    try output.writeAll("\x1b[0m");
+                    try output.writeAll(formatted[bar_width..]);
                 } else {
                     // File bars are solid background
-                    try writer.print("\x1b[100m\x1b[97m{s}\x1b[0m{s}", .{
+                    try output.print("\x1b[100m\x1b[97m{s}\x1b[0m{s}", .{
                         formatted[0..bar_width],
                         formatted[bar_width..],
                     });
                 }
             } else {
-                try writer.print("{s:>7}   ", .{size_str});
+                try output.print("{s:>7}   ", .{size_str});
             }
 
             if (show_git) {
-                try writer.print("{s}{s}{s}   ", .{ git_color, git_symbol, reset });
+                try output.print("{s}{s}{s}   ", .{ git_color, git_symbol, reset });
             }
-            try writer.print("{s}{s}{s}  {s}\n", .{ date_color, time_str, date_reset, name_display });
+            try output.print("{s}{s}{s}  {s}\n", .{ date_color, time_str, date_reset, name_display });
         },
         .full => {
             // Print inode if requested
             if (config.show_inodes) {
-                try writer.print("{d:>9} ", .{file.inode});
+                try output.print("{d:>9} ", .{file.inode});
             }
 
             // Octal mode
             const mode_str = try std.fmt.allocPrint(allocator, "{o:0>4}", .{file.mode & 0o7777});
             defer allocator.free(mode_str);
 
-            try writer.print("{s} ", .{mode_str});
+            try output.print("{s} ", .{mode_str});
 
             if (bar_width > 0) {
                 // Create padded size string for bar overlay (7 chars + 3 spaces = 10)
@@ -428,49 +467,48 @@ fn printFileEntry(
                 // Render visual bar with size overlaid
                 if (is_dir_bar) {
                     // Directory bars use box drawing characters
-                    try writer.writeAll("\x1b[100m\x1b[97m");
+                    try output.writeAll("\x1b[100m\x1b[97m");
                     for (formatted[0..bar_width]) |ch| {
                         if (ch == ' ') {
-                            try writer.writeAll("░");
+                            try output.writeAll("░");
                         } else {
-                            try writer.writeByte(ch);
+                            try output.writeByte(ch);
                         }
                     }
-                    try writer.writeAll("\x1b[0m");
-                    try writer.writeAll(formatted[bar_width..]);
+                    try output.writeAll("\x1b[0m");
+                    try output.writeAll(formatted[bar_width..]);
                 } else {
                     // File bars are solid background
-                    try writer.print("\x1b[100m\x1b[97m{s}\x1b[0m{s}", .{
+                    try output.print("\x1b[100m\x1b[97m{s}\x1b[0m{s}", .{
                         formatted[0..bar_width],
                         formatted[bar_width..],
                     });
                 }
             } else {
-                try writer.print("{s:>7}   ", .{size_str});
+                try output.print("{s:>7}   ", .{size_str});
             }
 
             if (show_git) {
-                try writer.print("{s}{s}{s}   ", .{ git_color, git_symbol, reset });
+                try output.print("{s}{s}{s}   ", .{ git_color, git_symbol, reset });
             }
 
             // Owner/group as uid/gid
             // -o: omit group, -g: omit owner
             if (config.omit_group and !config.omit_owner) {
                 // -o: show only owner
-                try writer.print("uid:{d:<10} ", .{file.uid});
+                try output.print("uid:{d:<10} ", .{file.uid});
             } else if (config.omit_owner and !config.omit_group) {
                 // -g: show only group
-                try writer.print("gid:{d:<10} ", .{file.gid});
+                try output.print("gid:{d:<10} ", .{file.gid});
             } else if (!config.omit_owner and !config.omit_group) {
                 // Default: show both
-                try writer.print("uid:{d:<10} gid:{d:<10} ", .{ file.uid, file.gid });
+                try output.print("uid:{d:<10} gid:{d:<10} ", .{ file.uid, file.gid });
             }
             // If both -o and -g are set, show nothing (no owner, no group)
 
-            try writer.print("{s}{s}{s}  {s}\n", .{ date_color, time_str, date_reset, name_display });
+            try output.print("{s}{s}{s}  {s}\n", .{ date_color, time_str, date_reset, name_display });
         },
     }
-    try writer.flush();
 }
 
 /// Format file size in human-readable format (B, K, M, G).
@@ -492,23 +530,27 @@ fn formatSizeInto(buf: []u8, size: u64, is_dir: bool, calc_dir_sizes: bool) ![]c
 /// Format time as "Mon DD HH:MM".
 fn formatTime(allocator: std.mem.Allocator, mtime: i128) ![]const u8 {
     const epoch_secs = @divFloor(mtime, std.time.ns_per_s);
-    const epoch_day = @divFloor(epoch_secs, std.time.s_per_day);
-    const day_secs = @mod(epoch_secs, std.time.s_per_day);
 
-    // Convert epoch day to year/month/day using manual calculation
-    // since Zig 0.15.2 doesn't have fromEpochDay
-    const year_day = std.time.epoch.EpochDay{ .day = @intCast(epoch_day) };
-    const year_and_day = year_day.calculateYearDay();
-    const month_day = year_and_day.calculateMonthDay();
-    const day_secs_casted = std.time.epoch.DaySeconds{ .secs = @intCast(day_secs) };
+    // Convert to the local timezone via libc so output matches `ls -l`
+    // (respects the active timezone and DST through the system tz database).
+    var time_val: c.time_t = @intCast(epoch_secs);
+    var tm_result: c.struct_tm = undefined;
+    if (c.localtime_r(&time_val, &tm_result) == null) return error.TimeConversionFailed;
 
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const month_name = month_names[@intFromEnum(month_day.month) - 1];
+    const month_name = month_names[@intCast(tm_result.tm_mon)];
 
+    // Cast the signed C int fields to unsigned so the `{d}` formatter does not
+    // prefix a `+` sign (the fields are always non-negative for a valid date).
     return try std.fmt.allocPrint(
         allocator,
         "{s} {d:>2} {d:0>2}:{d:0>2}",
-        .{ month_name, month_day.day_index + 1, day_secs_casted.getHoursIntoDay(), day_secs_casted.getMinutesIntoHour() },
+        .{
+            month_name,
+            @as(u32, @intCast(tm_result.tm_mday)),
+            @as(u32, @intCast(tm_result.tm_hour)),
+            @as(u32, @intCast(tm_result.tm_min)),
+        },
     );
 }
 
@@ -589,7 +631,7 @@ fn getTerminalWidth() usize {
         ws_ypixel: u16,
     };
 
-    const stdout_fd = std.fs.File.stdout().handle;
+    const stdout_fd = std.Io.File.stdout().handle;
     const TIOCGWINSZ: u32 = 0x40087468; // macOS/BSD value for TIOCGWINSZ
 
     var ws = std.mem.zeroes(winsize);
@@ -603,16 +645,11 @@ fn getTerminalWidth() usize {
 }
 
 /// Print files in JSON format.
-fn printJson(files: []const types.FileInfo) !void {
-    const stdout = std.fs.File.stdout();
-    var stdout_buffer: [STDOUT_BUFFER_SIZE]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buffer);
-    const writer = &stdout_writer.interface;
-
-    try writer.writeAll("[");
+fn printJson(files: []const types.FileInfo, output: *UnifiedOutput) !void {
+    try output.writeAll("[");
     for (files, 0..) |file, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print(
+        if (i > 0) try output.writeAll(",");
+        try output.print(
             \\
             \\  {{"name":"{s}","size":{d},"mode":"{o:0>4}","git":"{c}"}}
         ,
@@ -624,19 +661,13 @@ fn printJson(files: []const types.FileInfo) !void {
             },
         );
     }
-    try writer.writeAll("\n]\n");
-    try writer.flush();
+    try output.writeAll("\n]\n");
 }
 
 /// Print files in porcelain (machine-readable) format.
-fn printPorcelain(files: []const types.FileInfo) !void {
-    const stdout = std.fs.File.stdout();
-    var stdout_buffer: [STDOUT_BUFFER_SIZE]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buffer);
-    const writer = &stdout_writer.interface;
-
+fn printPorcelain(files: []const types.FileInfo, output: *UnifiedOutput) !void {
     for (files) |file| {
-        try writer.print(
+        try output.print(
             "{o:0>4} {d} {c} {s}\n",
             .{
                 file.mode & 0o7777,
@@ -646,7 +677,6 @@ fn printPorcelain(files: []const types.FileInfo) !void {
             },
         );
     }
-    try writer.flush();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -868,8 +898,16 @@ test "formatPermissions - file rw-r--r--" {
     try std.testing.expectEqualStrings("-rw-r--r--", str);
 }
 
+// Pin the timezone to UTC so formatTime tests are deterministic regardless of
+// the machine running them. formatTime now renders in local time via libc.
+fn forceUtcTimezone() void {
+    _ = c.setenv("TZ", "UTC", 1);
+    c.tzset();
+}
+
 test "formatTime - epoch zero" {
     const allocator = std.testing.allocator;
+    forceUtcTimezone();
 
     const str = try formatTime(allocator, 0);
     defer allocator.free(str);
@@ -880,6 +918,7 @@ test "formatTime - epoch zero" {
 
 test "formatTime - known timestamp" {
     const allocator = std.testing.allocator;
+    forceUtcTimezone();
 
     // 2024-03-15 14:30:00 UTC
     // This is approximately 1710513000 seconds since epoch
@@ -887,8 +926,8 @@ test "formatTime - known timestamp" {
     const str = try formatTime(allocator, timestamp_ns);
     defer allocator.free(str);
 
-    // Should be Mar 15 14:30
-    try std.testing.expect(std.mem.startsWith(u8, str, "Mar"));
+    // Should be Mar 15 14:30 in UTC
+    try std.testing.expectEqualStrings("Mar 15 14:30", str);
 }
 
 test "calculateSizeStats - empty array" {

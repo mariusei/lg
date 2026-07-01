@@ -15,8 +15,9 @@ release:
 	zig build -Doptimize=ReleaseFast
 
 # Run tests
-# Note: `zig build test` hangs in some environments due to IPC issues in Zig 0.15.x
-# We use `zig test` directly with pkg-config to avoid this
+# Note: `zig build test` works on Zig 0.16 (verified). This target invokes
+# `zig test` directly with pkg-config as a fallback for environments where the
+# build runner's IPC/listen protocol misbehaves (was a hang on Zig 0.15.x).
 test:
 	@UTF8_CFLAGS=$$(pkg-config --cflags libutf8proc); \
 	UTF8_LIBS=$$(pkg-config --libs libutf8proc); \

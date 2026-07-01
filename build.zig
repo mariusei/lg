@@ -18,8 +18,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link with utf8proc for Unicode normalization
-    exe.linkSystemLibrary("utf8proc");
-    exe.linkLibC();
+    exe.root_module.linkSystemLibrary("utf8proc", .{});
+    exe.root_module.link_libc = true;
 
     if (static_utf8proc) {
         // Prefer static linking when requested
@@ -50,8 +50,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link with utf8proc for Unicode normalization (same as exe)
-    unit_tests.linkSystemLibrary("utf8proc");
-    unit_tests.linkLibC();
+    unit_tests.root_module.linkSystemLibrary("utf8proc", .{});
+    unit_tests.root_module.link_libc = true;
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

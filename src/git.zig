@@ -8,7 +8,7 @@ pub const GitContext = struct {
 
     /// Initialize GitContext by loading git status for the given directory.
     /// Returns error if not a git repository or git command fails.
-    pub fn init(allocator: std.mem.Allocator, dir_path: []const u8) !GitContext {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) !GitContext {
         var self = GitContext{
             .allocator = allocator,
             .statuses = std.StringHashMap(types.FileInfo.GitStatus).init(allocator),
@@ -16,7 +16,7 @@ pub const GitContext = struct {
         };
 
         // Load git status - git itself will handle if not a repo
-        try self.load(dir_path);
+        try self.load(io, dir_path);
         return self;
     }
 
@@ -30,28 +30,21 @@ pub const GitContext = struct {
     }
 
     /// Execute `git status --porcelain=v2` and parse output into hash map
-    fn load(self: *GitContext, dir_path: []const u8) !void {
-        var child = std.process.Child.init(
-            &.{ "git", "status", "--porcelain=v2" },
-            self.allocator,
-        );
+    fn load(self: *GitContext, io: std.Io, dir_path: []const u8) !void {
         // TODO: Add environment variable isolation for security
         // (requires inheriting current env + adding security vars)
-        child.cwd = dir_path;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-
-        try child.spawn();
-
-        // Read stdout (blocks until process completes or pipe closes)
-        // Git has its own timeout mechanisms, no need for manual timeout
-        const stdout = try child.stdout.?.readToEndAlloc(self.allocator, types.GIT_STATUS_MAX_OUTPUT);
+        const run_result = try std.process.run(self.allocator, io, .{
+            .argv = &.{ "git", "status", "--porcelain=v2" },
+            .cwd = .{ .path = dir_path },
+            .stdout_limit = .limited(types.GIT_STATUS_MAX_OUTPUT),
+        });
+        const stdout = run_result.stdout;
         defer self.allocator.free(stdout);
+        defer self.allocator.free(run_result.stderr);
 
-        // Wait for process to complete
-        const result = try child.wait();
-        switch (result) {
-            .Exited => |code| if (code != 0) return error.GitCommandFailed,
+        // Check exit status
+        switch (run_result.term) {
+            .exited => |code| if (code != 0) return error.GitCommandFailed,
             else => return error.GitCommandFailed,
         }
 

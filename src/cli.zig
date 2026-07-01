@@ -4,15 +4,16 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const display = @import("display.zig");
 
 /// Parse command-line arguments into a Config struct.
 ///
 /// Allocates memory for file_filters if provided - caller owns the memory.
 /// Prints help and exits if -h/--help is passed.
-pub fn parseArgs(allocator: std.mem.Allocator) !types.Config {
+pub fn parseArgs(io: std.Io, allocator: std.mem.Allocator, process_args: std.process.Args) !types.Config {
     var config = types.Config.default();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try process_args.iterateAllocator(allocator);
     defer args.deinit();
 
     // Skip program name
@@ -41,7 +42,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) !types.Config {
             } else if (std.mem.eql(u8, arg, "--legend")) {
                 config.show_legend = true;
             } else if (std.mem.eql(u8, arg, "--help")) {
-                try printHelp();
+                try printHelp(io);
                 std.process.exit(0);
             } else if (std.mem.eql(u8, arg, "-ll")) {
                 // -ll goes directly to full detail level
@@ -86,7 +87,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) !types.Config {
                             }
                         },
                         'h' => {
-                            try printHelp();
+                            try printHelp(io);
                             std.process.exit(0);
                         },
                         else => {
@@ -115,7 +116,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) !types.Config {
     if (positional.items.len == 1) {
         const first = positional.items[0];
         // Check if single arg is a directory
-        const stat = std.fs.cwd().statFile(first) catch null;
+        const stat = std.Io.Dir.cwd().statFile(io, first, .{}) catch null;
         if (stat != null and stat.?.kind == .directory) {
             config.dir_path = first;
         } else {
@@ -155,13 +156,10 @@ pub fn parseArgs(allocator: std.mem.Allocator) !types.Config {
 }
 
 /// Print help message to stdout.
-fn printHelp() !void {
-    const stdout = std.fs.File.stdout();
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buffer);
-    const writer = &stdout_writer.interface;
-
-    try writer.writeAll(
+fn printHelp(io: std.Io) !void {
+    var output = display.UnifiedOutput.init(io);
+    defer output.flush() catch {};
+    try output.writeAll(
         \\Usage: lg [OPTIONS] [DIRECTORY] [FILES...]
         \\
         \\List directory contents with git status information.
@@ -215,7 +213,6 @@ fn printHelp() !void {
         \\  lg src/*.zig       # List specific files
         \\
     );
-    try writer.flush();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -253,7 +250,11 @@ test "Config toggles detail level correctly" {
 
 test "printHelp does not crash" {
     // Just ensure it doesn't crash
-    try printHelp();
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try printHelp(io);
 }
 
 test "flag parsing - show_all" {

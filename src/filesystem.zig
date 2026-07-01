@@ -37,9 +37,38 @@ fn utf8Equal(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a_nfc[0..a_len], b_nfc[0..b_len]);
 }
 
+/// Stat a path relative to a directory fd via libc `fstatat`.
+///
+/// Zig 0.16 removed `std.posix.fstatat`; the high-level `std.Io.File.Stat` no
+/// longer exposes uid/gid/mode, which this tool needs. We therefore call libc
+/// `fstatat` directly and keep the raw `std.c.Stat` (which has .mode/.uid/.gid/
+/// .ino/.size and an mtime() accessor), preserving the previous behavior.
+fn cFstatat(dirfd: std.posix.fd_t, path: []const u8, flags: u32) !std.c.Stat {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    var stat_buf: std.c.Stat = undefined;
+    const rc = std.c.fstatat(dirfd, path_z, &stat_buf, flags);
+    if (rc != 0) {
+        return switch (std.posix.errno(rc)) {
+            .NOENT => error.FileNotFound,
+            .ACCES => error.AccessDenied,
+            .NOTDIR => error.NotDir,
+            .LOOP => error.SymLinkLoop,
+            .NAMETOOLONG => error.NameTooLong,
+            else => error.StatFailed,
+        };
+    }
+    return stat_buf;
+}
+
 /// List files in directory based on config.
 /// Returns owned slice of FileInfo - caller must free each FileInfo.name and the slice itself.
 pub fn listFiles(
+    io: std.Io,
     allocator: std.mem.Allocator,
     config: types.Config,
     git_ctx: ?*const git.GitContext,
@@ -54,7 +83,7 @@ pub fn listFiles(
 
     // Add current directory entry when -d is used (like C version)
     if (config.calc_dir_sizes) {
-        const dir_stat = std.posix.fstatat(std.posix.AT.FDCWD, config.dir_path, 0) catch |err| {
+        const dir_stat = cFstatat(std.posix.AT.FDCWD, config.dir_path, 0) catch |err| {
             std.debug.print("Error: couldn't stat directory '{s}': {}\n", .{ config.dir_path, err });
             return err;
         };
@@ -83,12 +112,12 @@ pub fn listFiles(
     }
 
     // Open directory
-    var dir = try std.fs.cwd().openDir(config.dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(io, config.dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
     // Iterate entries
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         // Skip . and ..
         if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
 
@@ -107,9 +136,9 @@ pub fn listFiles(
             if (!match) continue;
         }
 
-        // Get file metadata using posix.fstatat to get uid/gid
+        // Get file metadata using fstatat to get uid/gid
         // Use SYMLINK_NOFOLLOW to prevent symlink loop attacks
-        const posix_stat = std.posix.fstatat(dir.fd, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
+        const posix_stat = cFstatat(dir.handle, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
             // Skip files we can't stat
             std.debug.print("Warning: couldn't stat {s}: {}\n", .{ entry.name, err });
             continue;
@@ -148,7 +177,7 @@ pub fn listFiles(
 
     // Calculate directory sizes if requested
     if (config.calc_dir_sizes) {
-        try calculateDirSizes(allocator, config.dir_path, list.items);
+        try calculateDirSizes(io, allocator, config.dir_path, list.items);
     }
 
     return list.toOwnedSlice(allocator);
@@ -171,6 +200,7 @@ fn validatePath(path: []const u8) !void {
 /// Calculate directory sizes using `du -sk` in batch.
 /// Much faster than calling du once per directory.
 fn calculateDirSizes(
+    io: std.Io,
     allocator: std.mem.Allocator,
     base_path: []const u8,
     files: []types.FileInfo,
@@ -207,27 +237,21 @@ fn calculateDirSizes(
     try args.append(allocator, "-sk");
     try args.appendSlice(allocator, dir_paths.items);
 
-    // Execute du with 30-second timeout
-    var child = std.process.Child.init(args.items, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    // Read stdout (blocks until process completes)
+    // Execute du
     // du is typically fast, and OS has its own timeout mechanisms
-    const stdout = child.stdout.?.readToEndAlloc(allocator, types.DU_MAX_OUTPUT) catch |err| {
-        // On read error, kill child process
-        _ = child.kill() catch {};
+    const run_result = std.process.run(allocator, io, .{
+        .argv = args.items,
+        .stdout_limit = .limited(types.DU_MAX_OUTPUT),
+    }) catch |err| {
         return err;
     };
+    const stdout = run_result.stdout;
     defer allocator.free(stdout);
-
-    const result = try child.wait();
+    defer allocator.free(run_result.stderr);
 
     // Check exit status
-    switch (result) {
-        .Exited => |code| {
+    switch (run_result.term) {
+        .exited => |code| {
             if (code != 0) {
                 // du failed, but we can continue - just won't have dir sizes
                 return;

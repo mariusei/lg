@@ -13,7 +13,9 @@ const git = @import("git.zig");
 const filesystem = @import("filesystem.zig");
 const display = @import("display.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
     // Arena allocator: all allocations freed with single deinit()
     // Why arena? Short-lived CLI tool, no need for granular tracking
     // All memory released when program exits anyway
@@ -23,7 +25,7 @@ pub fn main() !void {
     const allocator = arena.allocator();
 
     // Parse CLI arguments
-    const config = cli.parseArgs(allocator) catch |err| {
+    const config = cli.parseArgs(io, allocator, init.minimal.args) catch |err| {
         if (err == error.InvalidArgument) {
             std.process.exit(1);
         }
@@ -31,57 +33,44 @@ pub fn main() !void {
     };
 
     // Get git status (optional - may fail if not a git repo)
-    var git_ctx: ?git.GitContext = git.GitContext.init(allocator, config.dir_path) catch null;
+    var git_ctx: ?git.GitContext = git.GitContext.init(io, allocator, config.dir_path) catch null;
     defer if (git_ctx) |*ctx| ctx.deinit();
 
     // Show git info if requested
     if (config.show_branch) {
-        try showBranch(allocator);
+        try showBranch(io, allocator);
     }
     if (config.show_legend) {
-        try showLegend();
+        try showLegend(io);
     }
 
     // Collect files
-    const files = try filesystem.listFiles(allocator, config, if (git_ctx) |*ctx| ctx else null);
+    const files = try filesystem.listFiles(io, allocator, config, if (git_ctx) |*ctx| ctx else null);
     // No need to free - arena handles it
 
     // Sort files
     filesystem.sortFiles(files, config);
 
     // Display
-    try display.print(allocator, files, if (git_ctx) |*ctx| ctx else null, config);
+    try display.print(io, allocator, files, if (git_ctx) |*ctx| ctx else null, config);
 }
 
-fn showBranch(allocator: std.mem.Allocator) !void {
-    var child = std.process.Child.init(&.{ "git", "branch", "--show-current" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+fn showBranch(io: std.Io, allocator: std.mem.Allocator) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "branch", "--show-current" },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
-    try child.spawn();
-
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 1024);
-    defer allocator.free(stdout);
-
-    _ = try child.wait();
-
-    const branch = std.mem.trim(u8, stdout, &std.ascii.whitespace);
+    const branch = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
     if (branch.len > 0) {
         std.debug.print("Branch: {s}\n\n", .{branch});
     }
 }
 
-fn showLegend() !void {
-    // Buffered stdout: reduces syscalls (one flush vs many writes)
-    // Buffer size sufficient for typical legend output
-    // .interface provides generic writer for polymorphism
-    // Pattern: create buffer → create writer → get interface → flush
-    var stdout_buffer: [types.STDOUT_BUFFER_SIZE]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
-
-    try stdout.writeAll("Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\n\n");
-    try stdout.flush();
+fn showLegend(io: std.Io) !void {
+    var output = display.UnifiedOutput.init(io);
+    try output.writeAll("Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\n\n");
 }
 
 test "main runs without crashing" {
@@ -95,20 +84,28 @@ test "main runs without crashing" {
 
 test "showLegend prints without error" {
     // Test that legend prints successfully
-    try showLegend();
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try showLegend(io);
 }
 
 test "showBranch handles git failure gracefully" {
     // Test that showBranch doesn't crash even if git fails
     const allocator = std.testing.allocator;
 
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // This may fail if not in a git repo, but shouldn't crash
-    showBranch(allocator) catch |err| {
+    showBranch(io, allocator) catch |err| {
         // Expected errors when git is not available or not in a repo
         try std.testing.expect(
             err == error.FileNotFound or
                 err == error.BrokenPipe or
-                err == std.process.Child.SpawnError.InvalidExe,
+                err == std.process.SpawnError.InvalidExe,
         );
     };
 }
