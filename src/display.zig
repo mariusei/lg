@@ -20,6 +20,7 @@ const Tm = extern struct {
     tm_zone: ?[*:0]const u8,
 };
 extern fn localtime_r(timep: *const time_t, result: *Tm) callconv(.c) ?*Tm;
+extern fn time(tloc: ?*time_t) callconv(.c) time_t;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) callconv(.c) c_int;
 extern fn tzset() callconv(.c) void;
 
@@ -81,6 +82,9 @@ fn visualLength(s: []const u8) usize {
             i += 2;
             while (i < s.len and s[i] != 'm') : (i += 1) {}
             i += 1; // Skip the 'm'
+        } else if ((s[i] & 0xC0) == 0x80) {
+            // UTF-8 continuation byte: not a column of its own
+            i += 1;
         } else {
             len += 1;
             i += 1;
@@ -365,7 +369,8 @@ fn printFileEntry(
     const reset = if (use_color and git_color.len > 0 and !std.mem.eql(u8, git_color, colors.reset)) colors.reset else "";
 
     // Format time
-    const time_str = try formatTime(allocator, file.mtime);
+    const now_secs: i64 = @intCast(time(null));
+    const time_str = try formatTimeRel(allocator, file.mtime, now_secs);
     defer allocator.free(time_str);
 
     // Format name with color/suffix
@@ -568,6 +573,43 @@ fn formatTime(allocator: std.mem.Allocator, mtime: i128) ![]const u8 {
             @as(u32, @intCast(tm_result.tm_min)),
         },
     );
+}
+
+/// Format mtime for the Modified column.
+/// Younger than 7 days: compact relative time ("15m", "3t", "6d"; t = timer).
+/// Younger than 24h: additionally prefixed with "• " as a recency marker.
+/// Older (or future mtimes, e.g. clock skew): absolute "Mon DD HH:MM" as before.
+/// Result is right-padded with spaces to a visual width of 12 (the width of
+/// the absolute format) so the name column stays aligned.
+fn formatTimeRel(allocator: std.mem.Allocator, mtime: i128, now_secs: i64) ![]const u8 {
+    const REL_WIDTH: usize = 12;
+    const epoch_secs = @divFloor(mtime, std.time.ns_per_s);
+    const age: i128 = @as(i128, @intCast(now_secs)) - epoch_secs;
+
+    if (age >= 0 and age < 7 * 86400) {
+        const body = if (age < 3600)
+            try std.fmt.allocPrint(allocator, "{d}m", .{@divFloor(age, 60)})
+        else if (age < 86400)
+            try std.fmt.allocPrint(allocator, "{d}t", .{@divFloor(age, 3600)})
+        else
+            try std.fmt.allocPrint(allocator, "{d}d", .{@divFloor(age, 86400)});
+        defer allocator.free(body);
+
+        const core = if (age < 86400)
+            try std.fmt.allocPrint(allocator, "• {s}", .{body})
+        else
+            try allocator.dupe(u8, body);
+        defer allocator.free(core);
+
+        const visual = visualLength(core);
+        if (visual >= REL_WIDTH) return try allocator.dupe(u8, core);
+        const padding = try allocator.alloc(u8, REL_WIDTH - visual);
+        defer allocator.free(padding);
+        @memset(padding, ' ');
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ core, padding });
+    }
+
+    return try formatTime(allocator, mtime);
 }
 
 /// Get file type suffix based on config flags.
@@ -958,6 +1000,86 @@ test "formatTime - known timestamp" {
 
     // Should be Mar 15 14:30 in UTC
     try std.testing.expectEqualStrings("Mar 15 14:30", str);
+}
+
+test "formatTimeRel - minutes ago carries bullet marker" {
+    const allocator = std.testing.allocator;
+    forceUtcTimezone();
+
+    const now: i64 = 1_800_000_000; // fixed point in time
+    const mtime: i128 = @as(i128, now - 15 * 60) * std.time.ns_per_s;
+    const str = try formatTimeRel(allocator, mtime, now);
+    defer allocator.free(str);
+
+    // "• 15m" left-aligned, padded to 12 visual columns
+    try std.testing.expectEqualStrings("• 15m       ", str);
+    try std.testing.expectEqual(@as(usize, 12), visualLength(str));
+}
+
+test "formatTimeRel - hours ago carries bullet marker" {
+    const allocator = std.testing.allocator;
+    forceUtcTimezone();
+
+    const now: i64 = 1_800_000_000;
+    const mtime: i128 = @as(i128, now - 3 * 3600) * std.time.ns_per_s;
+    const str = try formatTimeRel(allocator, mtime, now);
+    defer allocator.free(str);
+
+    try std.testing.expectEqualStrings("• 3t        ", str);
+    try std.testing.expectEqual(@as(usize, 12), visualLength(str));
+}
+
+test "formatTimeRel - days ago has no marker" {
+    const allocator = std.testing.allocator;
+    forceUtcTimezone();
+
+    const now: i64 = 1_800_000_000;
+    const mtime: i128 = @as(i128, now - 3 * 86400) * std.time.ns_per_s;
+    const str = try formatTimeRel(allocator, mtime, now);
+    defer allocator.free(str);
+
+    try std.testing.expectEqualStrings("3d          ", str);
+    try std.testing.expectEqual(@as(usize, 12), visualLength(str));
+}
+
+test "formatTimeRel - under a day boundary keeps hours, not days" {
+    const allocator = std.testing.allocator;
+    forceUtcTimezone();
+
+    const now: i64 = 1_800_000_000;
+    // 23h59m ago: still hours, with marker
+    const mtime: i128 = @as(i128, now - (23 * 3600 + 59 * 60)) * std.time.ns_per_s;
+    const str = try formatTimeRel(allocator, mtime, now);
+    defer allocator.free(str);
+
+    try std.testing.expectEqualStrings("• 23t       ", str);
+}
+
+test "formatTimeRel - 7 days or older falls back to absolute" {
+    const allocator = std.testing.allocator;
+    forceUtcTimezone();
+
+    const now: i64 = 1_800_000_000;
+    const mtime: i128 = @as(i128, now - 7 * 86400) * std.time.ns_per_s;
+    const str = try formatTimeRel(allocator, mtime, now);
+    defer allocator.free(str);
+
+    // Falls back to the absolute format; exact date depends on tz, so just
+    // check it is not a relative string.
+    try std.testing.expect(std.mem.indexOf(u8, str, "•") == null);
+    try std.testing.expectEqual(@as(usize, 12), str.len);
+}
+
+test "formatTimeRel - future mtime falls back to absolute" {
+    const allocator = std.testing.allocator;
+    forceUtcTimezone();
+
+    const now: i64 = 1_800_000_000;
+    const mtime: i128 = @as(i128, now + 3600) * std.time.ns_per_s;
+    const str = try formatTimeRel(allocator, mtime, now);
+    defer allocator.free(str);
+
+    try std.testing.expect(std.mem.indexOf(u8, str, "•") == null);
 }
 
 test "calculateSizeStats - empty array" {
