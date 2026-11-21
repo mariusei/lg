@@ -160,20 +160,34 @@ fn printNormal(
     config: types.Config,
     output: *UnifiedOutput,
 ) !void {
+    // The "." entry added by -d is list-bookkeeping, not a listing entry:
+    // hide it here and keep only its size (used for the Total line below).
+    var root_size: ?u64 = null;
+    var visible: std.ArrayList(types.FileInfo) = .empty;
+    defer visible.deinit(allocator);
+    for (files) |file| {
+        if (std.mem.eql(u8, file.name, ".") and file.kind == .directory) {
+            root_size = file.size;
+            continue;
+        }
+        try visible.append(allocator, file);
+    }
+    const shown = visible.items;
+
     // Print header (skip in one-column mode)
     if (!config.one_column) {
         try printHeader(config, git_ctx != null, output);
     }
 
     // Calculate size statistics for visual bars
-    const size_stats = calculateSizeStats(files);
+    const size_stats = calculateSizeStats(shown);
 
     // Track previous file type for blank line insertion
     var prev_ext: ?[]const u8 = null;
     var prev_was_dir: ?bool = null;
 
-    // Print each file
-    for (files, 0..) |file, i| {
+    // Print each file (excluding the hidden "." bookkeeping entry)
+    for (shown, 0..) |file, i| {
         // Insert blank line when type changes (if grouping by type)
         if (config.group_by_type and i > 0) {
             const curr_is_dir = (file.kind == .directory);
@@ -217,17 +231,13 @@ fn printNormal(
 
     // Scenario D: total size line when -d is active. Suppressed in one-column
     // mode, where stdout must stay machine-consumable names-only.
-    // With -d the "." row carries du(cwd), which already includes everything
-    // below it; summing all rows would double-count. Fall back to summing the
-    // rows if no "." entry exists.
+    // root_size is du(cwd) carried in by the hidden "." entry; summing the
+    // visible rows instead would undercount hidden files.
     if (config.calc_dir_sizes and !config.one_column) {
-        var sum: u64 = 0;
-        var dot_total: ?u64 = null;
-        for (files) |file| {
-            sum +|= file.size;
-            if (std.mem.eql(u8, file.name, ".")) dot_total = file.size;
+        var total: u64 = root_size orelse 0;
+        if (root_size == null) {
+            for (shown) |file| total +|= file.size;
         }
-        const total = dot_total orelse sum;
         var size_buf: [32]u8 = undefined;
         const size_str = std.mem.trimStart(u8, try formatSizeInto(&size_buf, total, false, true), " ");
         const dim = if (config.use_color) colors.dim else "";
@@ -808,8 +818,14 @@ fn escapeJsonAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 /// Print files in JSON format.
 fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output: *UnifiedOutput) !void {
     try output.writeAll("[");
-    for (files, 0..) |file, i| {
-        if (i > 0) try output.writeAll(",");
+    var json_first = true;
+    for (files) |file| {
+        // The "." entry from -d is list bookkeeping, not a real entry.
+        if (std.mem.eql(u8, file.name, ".") and file.kind == .directory) continue;
+        if (!json_first) {
+            try output.writeAll(",");
+        }
+        json_first = false;
         const escaped_name = try escapeJsonAlloc(allocator, file.name);
         defer allocator.free(escaped_name);
         try output.print(
@@ -847,6 +863,7 @@ fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output
 fn printPorcelain(files: []const types.FileInfo, output: *UnifiedOutput, nul_terminated: bool) !void {
     const terminator: u8 = if (nul_terminated) 0 else '\n';
     for (files) |file| {
+        if (std.mem.eql(u8, file.name, ".") and file.kind == .directory) continue;
         try output.print(
             "{o:0>4} {d} {c} {s}",
             .{
