@@ -2,8 +2,8 @@
 class Lg < Formula
   desc "Modern ls replacement with git status integration and full Unicode support"
   homepage "https://github.com/mariusei/lg"
-  url "https://github.com/mariusei/lg/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "24d8d6b3a9c0c488edf26801b2cd9591c26124c7d6e22099c489c2519a0ae4b9"
+  url "https://github.com/mariusei/lg/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "b53ebd03c82d9b44a8d05a0261e3c9a4d4d4fff488c730853378048f9c61c538"
   license "MIT"
   head "https://github.com/mariusei/lg.git", branch: "main"
 
