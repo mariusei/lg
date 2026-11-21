@@ -214,6 +214,51 @@ fn printNormal(
             output,
         );
     }
+
+    // Scenario C: one-line git summary at the bottom of the listing.
+    if (git_ctx) |ctx| try printGitSummary(ctx, config, output);
+}
+
+/// Print a one-line summary of staged/unstaged/untracked counts and, when
+/// upstream is configured, ahead/behind. Prints nothing when the repo is
+/// clean and in sync (or has no upstream and nothing outstanding).
+fn printGitSummary(git_ctx: *const git.GitContext, config: types.Config, output: *UnifiedOutput) !void {
+    const s = git_ctx.summary;
+    var parts: [5][]const u8 = undefined;
+    var buf: [5][32]u8 = undefined;
+    var n: usize = 0;
+
+    if (s.staged > 0) {
+        parts[n] = std.fmt.bufPrint(&buf[n], "{d} staged", .{s.staged}) catch unreachable;
+        n += 1;
+    }
+    if (s.unstaged > 0) {
+        parts[n] = std.fmt.bufPrint(&buf[n], "{d} unstaged", .{s.unstaged}) catch unreachable;
+        n += 1;
+    }
+    if (s.untracked > 0) {
+        parts[n] = std.fmt.bufPrint(&buf[n], "{d} untracked", .{s.untracked}) catch unreachable;
+        n += 1;
+    }
+    if (s.has_upstream and s.ahead > 0) {
+        parts[n] = std.fmt.bufPrint(&buf[n], "{d} ahead", .{s.ahead}) catch unreachable;
+        n += 1;
+    }
+    if (s.has_upstream and s.behind > 0) {
+        parts[n] = std.fmt.bufPrint(&buf[n], "{d} behind", .{s.behind}) catch unreachable;
+        n += 1;
+    }
+    if (n == 0) return;
+
+    const dim = if (config.use_color) colors.dim else "";
+    const reset = if (config.use_color) colors.reset else "";
+    try output.writeAll(dim);
+    for (parts[0..n], 0..) |part, i| {
+        if (i > 0) try output.writeAll(" · ");
+        try output.writeAll(part);
+    }
+    try output.writeAll(reset);
+    try output.writeAll("\n");
 }
 
 /// Print header based on detail level.

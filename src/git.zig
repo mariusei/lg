@@ -1,10 +1,20 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+pub const StatusSummary = struct {
+    staged: u32 = 0,
+    unstaged: u32 = 0,
+    untracked: u32 = 0,
+    ahead: u32 = 0,
+    behind: u32 = 0,
+    has_upstream: bool = false,
+};
+
 pub const GitContext = struct {
     allocator: std.mem.Allocator,
     statuses: std.StringHashMap(types.FileInfo.GitStatus),
     rel_prefix: []const u8,
+    summary: StatusSummary = .{},
 
     /// Initialize GitContext by loading git status for the given directory.
     /// Returns error if not a git repository or git command fails.
@@ -34,7 +44,7 @@ pub const GitContext = struct {
         // TODO: Add environment variable isolation for security
         // (requires inheriting current env + adding security vars)
         const run_result = try std.process.run(self.allocator, io, .{
-            .argv = &.{ "git", "status", "--porcelain=v2" },
+            .argv = &.{ "git", "status", "--porcelain=v2", "--branch" },
             .cwd = .{ .path = dir_path },
             .stdout_limit = .limited(types.GIT_STATUS_MAX_OUTPUT),
         });
@@ -59,8 +69,11 @@ pub const GitContext = struct {
             } else if (line[0] == '?') {
                 // Untracked file entry
                 try self.parseUntrackedFile(line);
+            } else if (std.mem.startsWith(u8, line, "# branch.ab ")) {
+                // e.g. "# branch.ab +2 -1" (ahead 2, behind 1)
+                self.parseBranchAb(line["# branch.ab ".len..]);
             }
-            // Ignore other lines (e.g., '# branch.oid ...', '# branch.head ...', etc.)
+            // Ignore other lines (e.g., '# branch.oid ...', '# branch.head ...')
             // This is safe - git porcelain v2 format specifies these are metadata lines
         }
     }
@@ -89,6 +102,11 @@ pub const GitContext = struct {
 
         const status = parseStatusChars(xy[0], xy[1]);
 
+        // Summary counts XY independently: a file can be both staged and
+        // unstaged at once, and both must count.
+        if (xy[0] != '.' and xy[0] != ' ') self.summary.staged += 1;
+        if (xy[1] != '.' and xy[1] != ' ') self.summary.unstaged += 1;
+
         // Duplicate the path string since git output will be freed
         const owned_path = try self.allocator.dupe(u8, final_path);
         try self.statuses.put(owned_path, status);
@@ -101,7 +119,20 @@ pub const GitContext = struct {
 
         // Duplicate the path string since git output will be freed
         const owned_path = try self.allocator.dupe(u8, path);
+        self.summary.untracked += 1;
         try self.statuses.put(owned_path, .untracked);
+    }
+
+    /// Parse the "# branch.ab +<ahead> -<behind>" header line (porcelain v2 --branch).
+    fn parseBranchAb(self: *GitContext, payload: []const u8) void {
+        var iter = std.mem.tokenizeScalar(u8, payload, ' ');
+        const ahead_tok = iter.next() orelse return;
+        const behind_tok = iter.next() orelse return;
+        if (ahead_tok.len < 2 or ahead_tok[0] != '+') return;
+        if (behind_tok.len < 2 or behind_tok[0] != '-') return;
+        self.summary.ahead = std.fmt.parseInt(u32, ahead_tok[1..], 10) catch return;
+        self.summary.behind = std.fmt.parseInt(u32, behind_tok[1..], 10) catch return;
+        self.summary.has_upstream = true;
     }
 
     /// Convert git status XY codes to our GitStatus enum
