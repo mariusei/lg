@@ -63,6 +63,7 @@ pub const Config = struct {
     omit_group: bool, // -o
     omit_owner: bool, // -g
     sort_by_extension: bool, // -X: Sort by file extension (like ls -X)
+    nul_terminated: bool, // -z: NUL-terminate porcelain records (for xargs -0)
     color: ColorMode = .auto, // --color: when to emit ANSI colors
     use_color: bool = false, // Resolved at startup: color mode + isatty + NO_COLOR/TERM
 
@@ -89,6 +90,7 @@ pub const Config = struct {
             .omit_group = false,
             .omit_owner = false,
             .sort_by_extension = false,
+            .nul_terminated = false,
             .color = .auto,
             .use_color = false,
         };

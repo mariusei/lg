@@ -142,7 +142,7 @@ pub fn print(
     switch (config.output_format) {
         .normal => try printNormal(allocator, files, git_ctx, config, &output),
         .json => try printJson(allocator, files, &output),
-        .porcelain => try printPorcelain(files, &output),
+        .porcelain => try printPorcelain(files, &output, config.nul_terminated),
     }
 
     try output.flush();
@@ -691,10 +691,13 @@ fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output
 }
 
 /// Print files in porcelain (machine-readable) format.
-fn printPorcelain(files: []const types.FileInfo, output: *UnifiedOutput) !void {
+/// When nul_terminated is set, records end with NUL instead of LF so the
+/// output can be piped to `xargs -0` even for filenames containing newlines.
+fn printPorcelain(files: []const types.FileInfo, output: *UnifiedOutput, nul_terminated: bool) !void {
+    const terminator: u8 = if (nul_terminated) 0 else '\n';
     for (files) |file| {
         try output.print(
-            "{o:0>4} {d} {c} {s}\n",
+            "{o:0>4} {d} {c} {s}",
             .{
                 file.mode & 0o7777,
                 file.size,
@@ -702,6 +705,7 @@ fn printPorcelain(files: []const types.FileInfo, output: *UnifiedOutput) !void {
                 file.name,
             },
         );
+        try output.writeByte(terminator);
     }
 }
 

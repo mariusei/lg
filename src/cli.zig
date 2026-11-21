@@ -5,6 +5,10 @@
 const std = @import("std");
 const types = @import("types.zig");
 const display = @import("display.zig");
+const build_options = @import("build_options");
+
+/// Version string, injected from build.zig.zon via build.zig.
+pub const version = build_options.version;
 
 /// Parse command-line arguments into a Config struct.
 ///
@@ -57,6 +61,9 @@ pub fn parseArgs(io: std.Io, allocator: std.mem.Allocator, process_args: std.pro
                 config.color = .never;
             } else if (std.mem.eql(u8, arg, "--legend")) {
                 config.show_legend = true;
+            } else if (std.mem.eql(u8, arg, "--version")) {
+                try printVersion(io);
+                std.process.exit(0);
             } else if (std.mem.eql(u8, arg, "--help")) {
                 try printHelp(io);
                 std.process.exit(0);
@@ -86,6 +93,7 @@ pub fn parseArgs(io: std.Io, allocator: std.mem.Allocator, process_args: std.pro
                         'o' => config.omit_group = true,
                         'g' => config.omit_owner = true,
                         'X' => config.sort_by_extension = true,
+                        'z' => config.nul_terminated = true,
                         // -l toggles detail levels: minimal → standard → full
                         // -ll (combined) jumps directly to full detail level
                         'l' => {
@@ -226,10 +234,12 @@ pub const help_text =
     \\  -X                 Sort by file extension
     \\  --json             Output in JSON format
     \\  --porcelain        Machine-readable output
+    \\  -z                 NUL-terminate porcelain records (for xargs -0)
     \\  --branch           Show current git branch
     \\  --color[=WHEN]     Colorize output: auto (default), always, never
     \\  --no-color         Disable color output (same as --color=never)
     \\  --legend           Show git status legend
+    \\  --version          Show version
     \\  -h, --help         Show this help message
     \\
     \\Legacy ls Compatibility (capital letters):
@@ -258,6 +268,14 @@ pub const help_text =
     \\  lg src/*.zig       # List specific files
     \\
 ;
+
+/// Print version to stdout.
+fn printVersion(io: std.Io) !void {
+    var output: display.UnifiedOutput = undefined;
+    output.init(io);
+    defer output.flush() catch {};
+    try output.writeAll("lg " ++ version ++ "\n");
+}
 
 /// Print help message to stdout.
 fn printHelp(io: std.Io) !void {
@@ -300,12 +318,25 @@ test "Config toggles detail level correctly" {
     try std.testing.expectEqual(types.DetailLevel.full, config.detail_level);
 }
 
+test "flag parsing - nul_terminated" {
+    var config = types.Config.default();
+    try std.testing.expect(!config.nul_terminated);
+    config.nul_terminated = true;
+    try std.testing.expect(config.nul_terminated);
+}
+
 test "help text documents the documented flags" {
     // No I/O: assert on help_text directly so the test runner's stdout stays clean.
     try std.testing.expect(std.mem.indexOf(u8, help_text, "--color") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "--no-color") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "--porcelain") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "--json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--version") != null);
+}
+
+test "version matches build.zig.zon and is non-empty" {
+    try std.testing.expect(version.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, version, ".") != null);
 }
 
 test "flag parsing - show_all" {

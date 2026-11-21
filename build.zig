@@ -1,8 +1,14 @@
 const std = @import("std");
 
+const build_zon = @import("build.zig.zon");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Expose build.zig.zon's version to the binary so --version stays in sync.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", build_zon.version);
 
     // Option to statically link utf8proc (for standalone distribution)
     const static_utf8proc = b.option(bool, "static-utf8proc", "Statically link utf8proc library") orelse false;
@@ -20,6 +26,7 @@ pub fn build(b: *std.Build) void {
     // Link with utf8proc for Unicode normalization
     exe.root_module.linkSystemLibrary("utf8proc", .{});
     exe.root_module.link_libc = true;
+    exe.root_module.addOptions("build_options", build_options);
 
     if (static_utf8proc) {
         // Prefer static linking when requested
@@ -50,6 +57,7 @@ pub fn build(b: *std.Build) void {
     // Link with utf8proc for Unicode normalization (same as exe)
     unit_tests.root_module.linkSystemLibrary("utf8proc", .{});
     unit_tests.root_module.link_libc = true;
+    unit_tests.root_module.addOptions("build_options", build_options);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
