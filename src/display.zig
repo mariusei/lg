@@ -653,12 +653,23 @@ fn formatTime(allocator: std.mem.Allocator, mtime: i128) ![]const u8 {
     );
 }
 
+/// Wall-clock "HH:MM" for epoch seconds (local time).
+fn clockTime(buf: *[5]u8, epoch_secs: i64) ![]const u8 {
+    var time_val: time_t = @intCast(epoch_secs);
+    var tm_result: Tm = undefined;
+    if (localtime_r(&time_val, &tm_result) == null) return error.TimeConversionFailed;
+    return try std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{
+        @as(u32, @intCast(tm_result.tm_hour)),
+        @as(u32, @intCast(tm_result.tm_min)),
+    });
+}
+
 /// Format mtime for the Modified column.
-/// Younger than 7 days: compact relative time ("15m", "3t", "6d"; t = timer).
-/// Younger than 24h: additionally prefixed with "• " as a recency marker.
-/// Older (or future mtimes, e.g. clock skew): absolute "Mon DD HH:MM" as before.
-/// Result is right-padded with spaces to a visual width of 12 (the width of
-/// the absolute format) so the name column stays aligned.
+/// Younger than 7 days: compact relative time with wall-clock time
+/// ("• 15m 08:00", "3t 14:32", "6d 09:05"; t = timer). The bullet marks
+/// files changed within the last 24h. Older (or future mtime): absolute
+/// "Mon DD HH:MM". Result is right-padded to a visual width of 12 (the
+/// width of the absolute format) so the name column stays aligned.
 fn formatTimeRel(allocator: std.mem.Allocator, mtime: i128, now_secs: i64) ![]const u8 {
     const REL_WIDTH: usize = 12;
     const epoch_secs = @divFloor(mtime, std.time.ns_per_s);
@@ -673,10 +684,13 @@ fn formatTimeRel(allocator: std.mem.Allocator, mtime: i128, now_secs: i64) ![]co
             try std.fmt.allocPrint(allocator, "{d}d", .{@divFloor(age, 86400)});
         defer allocator.free(body);
 
+        var hm_buf: [5]u8 = undefined;
+        const hm = try clockTime(&hm_buf, @intCast(epoch_secs));
+
         const core = if (age < 86400)
-            try std.fmt.allocPrint(allocator, "• {s}", .{body})
+            try std.fmt.allocPrint(allocator, "• {s} {s}", .{ body, hm })
         else
-            try allocator.dupe(u8, body);
+            try std.fmt.allocPrint(allocator, "{s} {s}", .{ body, hm });
         defer allocator.free(core);
 
         const visual = visualLength(core);
@@ -1197,8 +1211,8 @@ test "formatTimeRel - minutes ago carries bullet marker" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    // "• 15m" left-aligned, padded to 12 visual columns
-    try std.testing.expectEqualStrings("• 15m       ", str);
+    // 2027-01-15 08:00 UTC minus 15 min = 07:45; UTC pinned by forceUtcTimezone
+    try std.testing.expectEqualStrings("• 15m 07:45 ", str);
     try std.testing.expectEqual(@as(usize, 12), visualLength(str));
 }
 
@@ -1211,7 +1225,7 @@ test "formatTimeRel - hours ago carries bullet marker" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    try std.testing.expectEqualStrings("• 3t        ", str);
+    try std.testing.expectEqualStrings("• 3t 05:00  ", str);
     try std.testing.expectEqual(@as(usize, 12), visualLength(str));
 }
 
@@ -1224,7 +1238,7 @@ test "formatTimeRel - days ago has no marker" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    try std.testing.expectEqualStrings("3d          ", str);
+    try std.testing.expectEqualStrings("3d 08:00    ", str);
     try std.testing.expectEqual(@as(usize, 12), visualLength(str));
 }
 
@@ -1238,7 +1252,7 @@ test "formatTimeRel - under a day boundary keeps hours, not days" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    try std.testing.expectEqualStrings("• 23t       ", str);
+    try std.testing.expectEqualStrings("• 23t 08:01 ", str);
 }
 
 test "formatTimeRel - 7 days or older falls back to absolute" {
