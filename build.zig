@@ -10,9 +10,6 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", build_zon.version);
 
-    // Option to statically link utf8proc (for standalone distribution)
-    const static_utf8proc = b.option(bool, "static-utf8proc", "Statically link utf8proc library") orelse false;
-
     // Executable
     const exe = b.addExecutable(.{
         .name = "lg",
@@ -23,15 +20,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link with utf8proc for Unicode normalization
-    exe.root_module.linkSystemLibrary("utf8proc", .{});
+    // utf8proc is vendored (vendor/utf8proc, MIT/Expat) so the build needs
+    // no system library and cross-compilation works out of the box.
+    exe.root_module.addCSourceFile(.{ .file = b.path("vendor/utf8proc/utf8proc.c"), .flags = &.{"-DUTF8PROC_EXPORTS"} });
+    exe.root_module.addIncludePath(b.path("vendor/utf8proc"));
     exe.root_module.link_libc = true;
     exe.root_module.addOptions("build_options", build_options);
-
-    if (static_utf8proc) {
-        // Prefer static linking when requested
-        exe.root_module.link_libc = true;
-    }
 
     b.installArtifact(exe);
 
@@ -54,8 +48,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link with utf8proc for Unicode normalization (same as exe)
-    unit_tests.root_module.linkSystemLibrary("utf8proc", .{});
+    unit_tests.root_module.addCSourceFile(.{ .file = b.path("vendor/utf8proc/utf8proc.c"), .flags = &.{"-DUTF8PROC_EXPORTS"} });
+    unit_tests.root_module.addIncludePath(b.path("vendor/utf8proc"));
     unit_tests.root_module.link_libc = true;
     unit_tests.root_module.addOptions("build_options", build_options);
 
