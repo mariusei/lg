@@ -68,6 +68,26 @@ fn cFstatat(dirfd: std.posix.fd_t, path: []const u8, flags: u32) !std.c.Stat {
     return stat_buf;
 }
 
+/// Check whether a regular file starts with "#!".
+/// Returns true on any read failure: we only flag files we positively
+/// inspected, to avoid false positives on unreadable executables.
+fn hasShebang(dirfd: std.posix.fd_t, name: []const u8) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (name.len >= path_buf.len) return true;
+    @memcpy(path_buf[0..name.len], name);
+    path_buf[name.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const fd = std.c.openat(dirfd, path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return true;
+    defer _ = std.c.close(fd);
+
+    var buf: [2]u8 = undefined;
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n < 2) return false;
+    return buf[0] == '#' and buf[1] == '!';
+}
+
 /// List files in directory based on config.
 /// Returns owned slice of FileInfo - caller must free each FileInfo.name and the slice itself.
 pub fn listFiles(
@@ -161,6 +181,26 @@ pub fn listFiles(
             else => continue, // Skip special files (device, named_pipe, etc.)
         };
 
+        // Anomaly detection (Scenario B). Costs at most one extra stat per
+        // symlink and a 2-byte read per executable; nothing else.
+        var anomalies = types.Anomaly{};
+        switch (kind) {
+            .symlink => {
+                // The stat above used SYMLINK_NOFOLLOW; follow the link now to
+                // detect dangling targets.
+                _ = cFstatat(dir.handle, entry.name, 0) catch {
+                    anomalies.broken_symlink = true;
+                };
+            },
+            .file => |f| {
+                if (posix_stat.size == 0) anomalies.empty_file = true;
+                if (f.executable and !hasShebang(dir.handle, entry.name)) {
+                    anomalies.exec_without_shebang = true;
+                }
+            },
+            .directory => {},
+        }
+
         const mtime_ts = posix_stat.mtime();
         const mtime_ns = @as(i128, mtime_ts.sec) * std.time.ns_per_s + mtime_ts.nsec;
 
@@ -175,6 +215,7 @@ pub fn listFiles(
             .git_status = git_status,
             .kind = kind,
             .inode = posix_stat.ino,
+            .anomalies = anomalies,
         });
     }
 

@@ -634,7 +634,20 @@ fn getFileTypeSuffix(file: types.FileInfo, config: types.Config) []const u8 {
 
 /// Format name with color and optional type suffix.
 fn formatName(allocator: std.mem.Allocator, file: types.FileInfo, config: types.Config) ![]const u8 {
-    const color = if (!config.use_color) "" else switch (file.kind) {
+    // Anomaly styling (Scenario B): broken symlink -> red name + " !" suffix;
+    // 0-byte regular file -> dimmed name. Broken symlink wins over dim.
+    const anomaly_color: []const u8 = if (file.anomalies.broken_symlink)
+        colors.anomaly_broken
+    else if (file.anomalies.empty_file)
+        colors.dim
+    else
+        "";
+
+    const color = if (!config.use_color)
+        ""
+    else if (anomaly_color.len > 0)
+        anomaly_color
+    else switch (file.kind) {
         .directory => colors.directory,
         .symlink => colors.symlink,
         .file => |f| if (f.executable) colors.executable else "",
@@ -642,6 +655,20 @@ fn formatName(allocator: std.mem.Allocator, file: types.FileInfo, config: types.
 
     const suffix = getFileTypeSuffix(file, config);
     const reset = if (color.len > 0) colors.reset else "";
+    // The bang marker is printed in red when color is on so it stays visible
+    // even when the rest of the line is styled; in plain output it is plain.
+    if (file.anomalies.broken_symlink) {
+        const bang_color = if (config.use_color) colors.anomaly_broken else "";
+        const bang_reset = if (config.use_color) colors.reset else "";
+        return try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s} !{s}", .{
+            color,
+            file.name,
+            suffix,
+            if (reset.len > 0) reset else "",
+            bang_color,
+            bang_reset,
+        });
+    }
 
     return try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{
         color,
@@ -719,7 +746,7 @@ fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output
         defer allocator.free(escaped_name);
         try output.print(
             \\
-            \\  {{"name":"{s}","size":{d},"mode":"{o:0>4}","git":"{c}"}}
+            \\  {{"name":"{s}","size":{d},"mode":"{o:0>4}","git":"{c}","anomalies":[
         ,
             .{
                 escaped_name,
@@ -728,6 +755,20 @@ fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output
                 @backingInt(file.git_status),
             },
         );
+        var anomaly_first = true;
+        const anomaly_names = [_][]const u8{ "broken_symlink", "empty_file", "exec_without_shebang" };
+        const anomaly_flags = [_]bool{
+            file.anomalies.broken_symlink,
+            file.anomalies.empty_file,
+            file.anomalies.exec_without_shebang,
+        };
+        for (anomaly_flags, anomaly_names) |flag, name| {
+            if (!flag) continue;
+            if (!anomaly_first) try output.writeAll(",");
+            anomaly_first = false;
+            try output.print("\"{s}\"", .{name});
+        }
+        try output.writeAll("]}");
     }
     try output.writeAll("\n]\n");
 }
@@ -795,6 +836,66 @@ test "formatSize - edge case 1024 bytes" {
     var buf: [16]u8 = undefined;
     const str = try formatSizeInto(&buf, 1024, false, false);
     try std.testing.expectEqualStrings("  1.0K", str);
+}
+
+test "formatName - broken symlink is red with bang suffix" {
+    const allocator = std.testing.allocator;
+
+    var file = types.FileInfo{
+        .name = "dangling",
+        .mode = 0o777,
+        .size = 0,
+        .mtime = 0,
+        .uid = 0,
+        .gid = 0,
+        .git_status = .clean,
+        .kind = .symlink,
+        .inode = 12345,
+    };
+    file.anomalies.broken_symlink = true;
+
+    // No color: plain name + " !" suffix, no escape codes
+    var config = types.Config.default();
+    config.use_color = false;
+    const plain = try formatName(allocator, file, config);
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("dangling !", plain);
+
+    // With color: red name and red bang
+    config.use_color = true;
+    const colored = try formatName(allocator, file, config);
+    defer allocator.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, colors.anomaly_broken) != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "dangling") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored, " !") != null);
+}
+
+test "formatName - empty file is dimmed when color is on" {
+    const allocator = std.testing.allocator;
+
+    var file = types.FileInfo{
+        .name = "empty.txt",
+        .mode = 0o644,
+        .size = 0,
+        .mtime = 0,
+        .uid = 0,
+        .gid = 0,
+        .git_status = .clean,
+        .kind = .{ .file = .{ .executable = false } },
+        .inode = 12345,
+    };
+    file.anomalies.empty_file = true;
+
+    var config = types.Config.default();
+    config.use_color = true;
+    const colored = try formatName(allocator, file, config);
+    defer allocator.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, colors.dim) != null);
+
+    config.use_color = false;
+    const plain = try formatName(allocator, file, config);
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("empty.txt", plain);
 }
 
 test "formatName - regular file (no flags)" {

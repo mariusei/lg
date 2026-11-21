@@ -41,6 +41,10 @@ pub const symlink = "\x1b[36m"; // Cyan
 pub const directory = "\x1b[34m"; // Blue
 pub const executable = "\x1b[32m"; // Green
 
+// Anomaly colors (Scenario B)
+pub const anomaly_broken = "\x1b[31m"; // Red: broken symlink
+pub const dim = "\x1b[2m"; // Dim: empty (0-byte) file
+
 // Linear search through color names - acceptable performance tradeoff
 // Called once per file (not hot path)
 // 14 comparisons worst-case << git subprocess overhead (~10ms)
@@ -62,6 +66,8 @@ pub fn getColor(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "git_untracked")) return git_untracked;
     if (std.mem.eql(u8, name, "git_ignored")) return git_ignored;
     if (std.mem.eql(u8, name, "git_clean")) return git_clean;
+    if (std.mem.eql(u8, name, "anomaly_broken")) return anomaly_broken;
+    if (std.mem.eql(u8, name, "dim")) return dim;
     if (std.mem.eql(u8, name, "symlink")) return symlink;
     if (std.mem.eql(u8, name, "directory")) return directory;
     if (std.mem.eql(u8, name, "executable")) return executable;

@@ -97,6 +97,15 @@ pub const Config = struct {
     }
 };
 
+/// Anomaly flags detected at list time (Scenario B).
+/// packed u8 so FileInfo stays small; construct with named fields.
+pub const Anomaly = packed struct(u8) {
+    broken_symlink: bool = false,
+    empty_file: bool = false,
+    exec_without_shebang: bool = false,
+    _pad: u5 = 0,
+};
+
 pub const FileInfo = struct {
     name: []const u8,
     mode: std.posix.mode_t,
@@ -107,6 +116,7 @@ pub const FileInfo = struct {
     git_status: GitStatus,
     kind: FileKind,
     inode: u64,
+    anomalies: Anomaly = .{},
 
     // FileKind: Tagged union for file type discrimination
     // - file: Regular file (may or may not be executable)

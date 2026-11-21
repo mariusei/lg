@@ -73,7 +73,7 @@ fn showBranch(io: std.Io, allocator: std.mem.Allocator) !void {
     }
 }
 
-const legend_text = "Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\n\n";
+const legend_text = "Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\nAnomalies: red name + '!' = broken symlink, dim name = empty (0-byte) file\n\n";
 
 fn showLegend(io: std.Io) !void {
     var output: display.UnifiedOutput = undefined;
