@@ -76,6 +76,10 @@ lg --branch
 # Show legend
 lg --legend
 
+# Color: auto by default (only on a TTY; respects NO_COLOR and TERM=dumb)
+lg --color=always   # force colors
+lg --color=never    # never (or: lg --no-color)
+
 # Combine flags (like ls)
 lg -lan     # all files, alphabetical, standard detail
 lg -sr      # sort by size, reversed (largest last)

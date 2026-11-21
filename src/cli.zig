@@ -39,6 +39,22 @@ pub fn parseArgs(io: std.Io, allocator: std.mem.Allocator, process_args: std.pro
                 config.output_format = .porcelain;
             } else if (std.mem.eql(u8, arg, "--branch")) {
                 config.show_branch = true;
+            } else if (std.mem.eql(u8, arg, "--color")) {
+                config.color = .always;
+            } else if (std.mem.startsWith(u8, arg, "--color=")) {
+                const value = arg["--color=".len..];
+                if (std.mem.eql(u8, value, "auto")) {
+                    config.color = .auto;
+                } else if (std.mem.eql(u8, value, "always")) {
+                    config.color = .always;
+                } else if (std.mem.eql(u8, value, "never")) {
+                    config.color = .never;
+                } else {
+                    std.debug.print("Unknown --color value: {s} (expected auto, always or never)\n", .{value});
+                    return error.InvalidArgument;
+                }
+            } else if (std.mem.eql(u8, arg, "--no-color")) {
+                config.color = .never;
             } else if (std.mem.eql(u8, arg, "--legend")) {
                 config.show_legend = true;
             } else if (std.mem.eql(u8, arg, "--help")) {
@@ -152,67 +168,103 @@ pub fn parseArgs(io: std.Io, allocator: std.mem.Allocator, process_args: std.pro
         }
     }
 
+    // Resolve color output: explicit flag wins, otherwise honor NO_COLOR / TERM / tty.
+    config.use_color = resolveColor(config.color);
+
     return config;
 }
 
+/// Pure decision logic for whether to emit ANSI colors.
+/// Kept separate from the environment probe so it can be unit tested.
+fn colorAllowed(is_tty: bool, no_color: ?[]const u8, term: ?[]const u8) bool {
+    if (!is_tty) return false;
+    if (no_color) |v| {
+        if (v.len > 0) return false; // NO_COLOR: any non-empty value disables color
+    }
+    if (term) |t| {
+        if (std.mem.eql(u8, t, "dumb")) return false;
+    }
+    return true;
+}
+
+fn resolveColor(mode: types.ColorMode) bool {
+    return switch (mode) {
+        .always => true,
+        .never => false,
+        .auto => blk: {
+            const is_tty = std.c.isatty(1) != 0; // stdout
+            const no_color: ?[]const u8 = if (std.c.getenv("NO_COLOR")) |p| std.mem.span(p) else null;
+            const term: ?[]const u8 = if (std.c.getenv("TERM")) |p| std.mem.span(p) else null;
+            break :blk colorAllowed(is_tty, no_color, term);
+        },
+    };
+}
+
+/// Help text, kept separate from printing so tests can assert on it
+/// without writing to stdout (the test runner owns stdout).
+pub const help_text =
+    \\Usage: lg [OPTIONS] [DIRECTORY] [FILES...]
+    \\
+    \\List directory contents with git status information.
+    \\
+    \\Options:
+    \\  -a, --all          Show hidden files
+    \\  -n, --name         Sort alphabetically by name (default: by time)
+    \\  -r                 Reverse sort order
+    \\  -s                 Sort by size (largest first)
+    \\  -i                 Show inode numbers
+    \\  -t, --type         Group by file type with blank lines between groups
+    \\  -d, --dir-sizes    Calculate directory sizes (may be slow)
+    \\  -l                 Standard detail level (permissions, owner)
+    \\  -ll                Full detail level (octal mode, group)
+    \\  -F                 Append file type indicators (/ for dirs, * for exec, @ for links)
+    \\  -p                 Append / to directory names
+    \\  -1                 One entry per line (simple output)
+    \\  -U                 Unsorted (directory order, faster)
+    \\  -o                 Long format, omit group info
+    \\  -g                 Long format, omit owner info
+    \\  -X                 Sort by file extension
+    \\  --json             Output in JSON format
+    \\  --porcelain        Machine-readable output
+    \\  --branch           Show current git branch
+    \\  --color[=WHEN]     Colorize output: auto (default), always, never
+    \\  --no-color         Disable color output (same as --color=never)
+    \\  --legend           Show git status legend
+    \\  -h, --help         Show this help message
+    \\
+    \\Legacy ls Compatibility (capital letters):
+    \\  -T                 Sort by time (ls -t equivalent)
+    \\
+    \\Compatibility Notes:
+    \\  -t    Group by type (lg) vs sort by time (ls) → Use -T for time sort
+    \\  -d    Calculate dir sizes (lg) vs list dir (ls) → Different behavior
+    \\  -s    Sort by size (lg) vs show blocks (ls) → Different behavior
+    \\
+    \\Git Status Symbols:
+    \\  [●] Staged changes    [○] Unstaged changes
+    \\  [?] Untracked files   [!] Ignored files
+    \\  [·] Clean/tracked (green dot)
+    \\
+    \\Examples:
+    \\  lg                 # List current directory
+    \\  lg -a              # Show hidden files
+    \\  lg -l /tmp         # List /tmp with permissions
+    \\  lg -sr             # Sort by size, largest last (reversed)
+    \\  lg -iT             # Show inodes, sort by time
+    \\  lg -F              # Show file type indicators
+    \\  lg -1              # One column (simple list)
+    \\  lg -U              # Unsorted (fast, natural order)
+    \\  lg -X              # Sort by extension
+    \\  lg src/*.zig       # List specific files
+    \\
+;
+
 /// Print help message to stdout.
 fn printHelp(io: std.Io) !void {
-    var output = display.UnifiedOutput.init(io);
+    var output: display.UnifiedOutput = undefined;
+    output.init(io);
     defer output.flush() catch {};
-    try output.writeAll(
-        \\Usage: lg [OPTIONS] [DIRECTORY] [FILES...]
-        \\
-        \\List directory contents with git status information.
-        \\
-        \\Options:
-        \\  -a, --all          Show hidden files
-        \\  -n, --name         Sort alphabetically by name (default: by time)
-        \\  -r                 Reverse sort order
-        \\  -s                 Sort by size (largest first)
-        \\  -i                 Show inode numbers
-        \\  -t, --type         Group by file type with blank lines between groups
-        \\  -d, --dir-sizes    Calculate directory sizes (may be slow)
-        \\  -l                 Standard detail level (permissions, owner)
-        \\  -ll                Full detail level (octal mode, group)
-        \\  -F                 Append file type indicators (/ for dirs, * for exec, @ for links)
-        \\  -p                 Append / to directory names
-        \\  -1                 One entry per line (simple output)
-        \\  -U                 Unsorted (directory order, faster)
-        \\  -o                 Long format, omit group info
-        \\  -g                 Long format, omit owner info
-        \\  -X                 Sort by file extension
-        \\  --json             Output in JSON format
-        \\  --porcelain        Machine-readable output
-        \\  --branch           Show current git branch
-        \\  --legend           Show git status legend
-        \\  -h, --help         Show this help message
-        \\
-        \\Legacy ls Compatibility (capital letters):
-        \\  -T                 Sort by time (ls -t equivalent)
-        \\
-        \\Compatibility Notes:
-        \\  -t    Group by type (lg) vs sort by time (ls) → Use -T for time sort
-        \\  -d    Calculate dir sizes (lg) vs list dir (ls) → Different behavior
-        \\  -s    Sort by size (lg) vs show blocks (ls) → Different behavior
-        \\
-        \\Git Status Symbols:
-        \\  [●] Staged changes    [○] Unstaged changes
-        \\  [?] Untracked files   [!] Ignored files
-        \\  [·] Clean/tracked (green dot)
-        \\
-        \\Examples:
-        \\  lg                 # List current directory
-        \\  lg -a              # Show hidden files
-        \\  lg -l /tmp         # List /tmp with permissions
-        \\  lg -sr             # Sort by size, largest last (reversed)
-        \\  lg -iT             # Show inodes, sort by time
-        \\  lg -F              # Show file type indicators
-        \\  lg -1              # One column (simple list)
-        \\  lg -U              # Unsorted (fast, natural order)
-        \\  lg -X              # Sort by extension
-        \\  lg src/*.zig       # List specific files
-        \\
-    );
+    try output.writeAll(help_text);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -248,13 +300,12 @@ test "Config toggles detail level correctly" {
     try std.testing.expectEqual(types.DetailLevel.full, config.detail_level);
 }
 
-test "printHelp does not crash" {
-    // Just ensure it doesn't crash
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    try printHelp(io);
+test "help text documents the documented flags" {
+    // No I/O: assert on help_text directly so the test runner's stdout stays clean.
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--color") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--no-color") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--porcelain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--json") != null);
 }
 
 test "flag parsing - show_all" {
@@ -369,6 +420,27 @@ test "all boolean flags default to false" {
     try std.testing.expect(!config.show_legend);
     try std.testing.expect(!config.calc_dir_sizes);
     try std.testing.expect(!config.group_by_type);
+}
+
+test "colorAllowed - tty with clean env allows color" {
+    try std.testing.expect(colorAllowed(true, null, null));
+    try std.testing.expect(colorAllowed(true, "", null)); // empty NO_COLOR counts as unset
+    try std.testing.expect(colorAllowed(true, null, "xterm-256color"));
+}
+
+test "colorAllowed - no tty disables color" {
+    try std.testing.expect(!colorAllowed(false, null, null));
+    try std.testing.expect(!colorAllowed(false, "", "xterm"));
+}
+
+test "colorAllowed - NO_COLOR disables color" {
+    try std.testing.expect(!colorAllowed(true, "1", null));
+    try std.testing.expect(!colorAllowed(true, "anything", "xterm-256color"));
+}
+
+test "colorAllowed - TERM=dumb disables color" {
+    try std.testing.expect(!colorAllowed(true, null, "dumb"));
+    try std.testing.expect(colorAllowed(true, null, "dumb-ish")); // exact match only
 }
 
 test "output format defaults to normal" {

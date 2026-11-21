@@ -20,6 +20,12 @@ pub const GIT_STATUS_MAX_OUTPUT = 1024 * 1024;
 /// Max output size for du command (10MB for large directory trees)
 pub const DU_MAX_OUTPUT = 10 * 1024 * 1024;
 
+pub const ColorMode = enum {
+    auto,
+    always,
+    never,
+};
+
 pub const DetailLevel = enum {
     minimal,
     standard,
@@ -57,6 +63,8 @@ pub const Config = struct {
     omit_group: bool,            // -o
     omit_owner: bool,            // -g
     sort_by_extension: bool,     // -X: Sort by file extension (like ls -X)
+    color: ColorMode = .auto,    // --color: when to emit ANSI colors
+    use_color: bool = false,     // Resolved at startup: color mode + isatty + NO_COLOR/TERM
 
     pub fn default() Config {
         return .{
@@ -81,6 +89,8 @@ pub const Config = struct {
             .omit_group = false,
             .omit_owner = false,
             .sort_by_extension = false,
+            .color = .auto,
+            .use_color = false,
         };
     }
 };

@@ -68,9 +68,13 @@ fn showBranch(io: std.Io, allocator: std.mem.Allocator) !void {
     }
 }
 
+const legend_text = "Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\n\n";
+
 fn showLegend(io: std.Io) !void {
-    var output = display.UnifiedOutput.init(io);
-    try output.writeAll("Git Status: [●]=Staged [○]=Unstaged [?]=Untracked\n\n");
+    var output: display.UnifiedOutput = undefined;
+    output.init(io);
+    try output.writeAll(legend_text);
+    try output.flush();
 }
 
 test "main runs without crashing" {
@@ -82,13 +86,12 @@ test "main runs without crashing" {
     _ = allocator;
 }
 
-test "showLegend prints without error" {
-    // Test that legend prints successfully
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    try showLegend(io);
+test "legend text documents all symbols" {
+    // No I/O: legend_text is what showLegend prints.
+    try std.testing.expect(std.mem.indexOf(u8, legend_text, "●") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legend_text, "○") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legend_text, "?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legend_text, "Untracked") != null);
 }
 
 test "showBranch handles git failure gracefully" {
@@ -123,4 +126,13 @@ test "arena allocator cleanup" {
 
     // No need to free - arena handles it
     // This test passes if no memory leaks occur
+}
+
+// Pull in tests from imported modules so `zig build test` actually runs them.
+test {
+    std.testing.refAllDecls(cli);
+    std.testing.refAllDecls(git);
+    std.testing.refAllDecls(filesystem);
+    std.testing.refAllDecls(display);
+    std.testing.refAllDecls(types);
 }

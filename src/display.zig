@@ -16,7 +16,6 @@ const MIN_BAR_WIDTH: usize = 1;
 const MAX_BAR_WIDTH: usize = 9;
 const BAR_RANGE: usize = MAX_BAR_WIDTH - MIN_BAR_WIDTH; // 8 characters of range
 const DIR_BAR_FILL = "░"; // U+2591 Light Shade for directory bars
-const DEFAULT_TERMINAL_WIDTH: usize = 80; // Fallback if detection fails
 
 /// Unified buffered output writer for consistent stdout handling
 /// Solves terminal emulator parsing issues by using single buffer/flush
@@ -25,15 +24,16 @@ pub const UnifiedOutput = struct {
     buffer: [STDOUT_BUFFER_SIZE]u8,
     writer: std.Io.File.Writer,
 
-    /// Create unified output with configured buffer size
-    pub fn init(io: std.Io) UnifiedOutput {
-        var self = UnifiedOutput{
+    /// Create unified output with configured buffer size.
+    /// Takes the destination by pointer: the writer stores a pointer into
+    /// `self.buffer`, so the struct must not move after init.
+    pub fn init(self: *UnifiedOutput, io: std.Io) void {
+        self.* = .{
             .stdout = std.Io.File.stdout(),
             .buffer = undefined,
             .writer = undefined,
         };
         self.writer = self.stdout.writer(io, &self.buffer);
-        return self;
     }
 
     /// Write formatted string
@@ -123,11 +123,12 @@ pub fn print(
     git_ctx: ?*const git.GitContext,
     config: types.Config,
 ) !void {
-    var output = UnifiedOutput.init(io);
+    var output: UnifiedOutput = undefined;
+    output.init(io);
 
     switch (config.output_format) {
         .normal => try printNormal(allocator, files, git_ctx, config, &output),
-        .json => try printJson(files, &output),
+        .json => try printJson(allocator, files, &output),
         .porcelain => try printPorcelain(files, &output),
     }
 
@@ -345,9 +346,10 @@ fn printFileEntry(
     }
 
     // Git status
+    const use_color = config.use_color;
     const git_symbol = file.git_status.symbol();
-    const git_color = colors.getColor(file.git_status.colorName());
-    const reset = if (git_color.len > 0 and !std.mem.eql(u8, git_color, colors.reset)) colors.reset else "";
+    const git_color = if (use_color) colors.getColor(file.git_status.colorName()) else "";
+    const reset = if (use_color and git_color.len > 0 and !std.mem.eql(u8, git_color, colors.reset)) colors.reset else "";
 
     // Format time
     const time_str = try formatTime(allocator, file.mtime);
@@ -358,8 +360,9 @@ fn printFileEntry(
     defer allocator.free(name_display);
 
     // Alternating date color
-    const date_color = if (index % 2 == 0) "" else "\x1b[38;5;241m";
-    const date_reset = if (index % 2 == 0) "" else colors.reset;
+    const date_alt = use_color and index % 2 == 1;
+    const date_color = if (date_alt) "\x1b[38;5;241m" else "";
+    const date_reset = if (date_alt) colors.reset else "";
 
     switch (detail) {
         .minimal => {
@@ -368,7 +371,7 @@ fn printFileEntry(
                 try output.print("{d:>9} ", .{file.inode});
             }
 
-            if (bar_width > 0) {
+            if (bar_width > 0 and use_color) {
                 // Create padded size string for bar overlay (7 chars + 5 spaces = 12)
                 var padded_size: [12]u8 = undefined;
                 const formatted = try std.fmt.bufPrint(&padded_size, "{s:>7}     ", .{size_str});
@@ -413,7 +416,7 @@ fn printFileEntry(
 
             try output.print("{s} ", .{perm_str});
 
-            if (bar_width > 0) {
+            if (bar_width > 0 and use_color) {
                 // Create padded size string for bar overlay (7 chars + 3 spaces = 10)
                 var padded_size: [10]u8 = undefined;
                 const formatted = try std.fmt.bufPrint(&padded_size, "{s:>7}   ", .{size_str});
@@ -459,7 +462,7 @@ fn printFileEntry(
 
             try output.print("{s} ", .{mode_str});
 
-            if (bar_width > 0) {
+            if (bar_width > 0 and use_color) {
                 // Create padded size string for bar overlay (7 chars + 3 spaces = 10)
                 var padded_size: [10]u8 = undefined;
                 const formatted = try std.fmt.bufPrint(&padded_size, "{s:>7}   ", .{size_str});
@@ -576,7 +579,7 @@ fn getFileTypeSuffix(file: types.FileInfo, config: types.Config) []const u8 {
 
 /// Format name with color and optional type suffix.
 fn formatName(allocator: std.mem.Allocator, file: types.FileInfo, config: types.Config) ![]const u8 {
-    const color = switch (file.kind) {
+    const color = if (!config.use_color) "" else switch (file.kind) {
         .directory => colors.directory,
         .symlink => colors.symlink,
         .file => |f| if (f.executable) colors.executable else "",
@@ -621,40 +624,50 @@ fn formatPermissions(allocator: std.mem.Allocator, file: types.FileInfo) ![]cons
     return try std.fmt.allocPrint(allocator, "{s}", .{perm});
 }
 
-/// Get terminal width in columns. Returns DEFAULT_TERMINAL_WIDTH if detection fails.
-fn getTerminalWidth() usize {
-    // Define C winsize struct directly since std.posix.winsize may have different fields
-    const winsize = extern struct {
-        ws_row: u16,
-        ws_col: u16,
-        ws_xpixel: u16,
-        ws_ypixel: u16,
-    };
-
-    const stdout_fd = std.Io.File.stdout().handle;
-    const TIOCGWINSZ: u32 = 0x40087468; // macOS/BSD value for TIOCGWINSZ
-
-    var ws = std.mem.zeroes(winsize);
-    const result = std.c.ioctl(stdout_fd, TIOCGWINSZ, @intFromPtr(&ws));
-
-    if (result == 0 and ws.ws_col > 0) {
-        return ws.ws_col;
+/// Escape a string for inclusion inside a JSON double-quoted string.
+/// Follows RFC 8259: quote, backslash and control characters must be escaped.
+fn escapeJsonAlloc(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.ensureTotalCapacity(allocator, s.len + 16);
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            '\x08' => try buf.appendSlice(allocator, "\\b"),
+            '\x0c' => try buf.appendSlice(allocator, "\\f"),
+            else => {
+                if (ch < 0x20) {
+                    var hex: [6]u8 = undefined;
+                    const escaped = try std.fmt.bufPrint(&hex, "\\u{x:0>4}", .{ch});
+                    try buf.appendSlice(allocator, escaped);
+                } else {
+                    // Bytes >= 0x20 are copied verbatim. Multi-byte UTF-8
+                    // sequences pass through unchanged, which is valid JSON.
+                    try buf.append(allocator, ch);
+                }
+            },
+        }
     }
-
-    return DEFAULT_TERMINAL_WIDTH;
+    return buf.toOwnedSlice(allocator);
 }
 
 /// Print files in JSON format.
-fn printJson(files: []const types.FileInfo, output: *UnifiedOutput) !void {
+fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output: *UnifiedOutput) !void {
     try output.writeAll("[");
     for (files, 0..) |file, i| {
         if (i > 0) try output.writeAll(",");
+        const escaped_name = try escapeJsonAlloc(allocator, file.name);
+        defer allocator.free(escaped_name);
         try output.print(
             \\
             \\  {{"name":"{s}","size":{d},"mode":"{o:0>4}","git":"{c}"}}
         ,
             .{
-                file.name,
+                escaped_name,
                 file.size,
                 file.mode & 0o7777,
                 @intFromEnum(file.git_status),
@@ -1011,11 +1024,6 @@ test "printPorcelain - single file" {
     _ = files;
 }
 
-test "getTerminalWidth - returns default" {
-    const width = getTerminalWidth();
-    try std.testing.expectEqual(@as(usize, 80), width);
-}
-
 test "formatName - directory with -p (slash only)" {
     const allocator = std.testing.allocator;
 
@@ -1061,4 +1069,41 @@ test "formatName - file without -F or -p (no suffix)" {
     // Should have color but NO * suffix without -F
     try std.testing.expect(std.mem.indexOf(u8, str, "*") == null);
     try std.testing.expect(std.mem.indexOf(u8, str, "exec") != null);
+}
+
+test "UnifiedOutput - writer buffer points into the instance, not a dead stack frame" {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var output: UnifiedOutput = undefined;
+    output.init(io);
+
+    // The writer's buffer slice must refer to output.buffer, not to the
+    // stack frame of init(). If init returned by value, the writer would
+    // dangle after init returned.
+    const writer_buf_ptr = @intFromPtr(output.writer.interface.buffer.ptr);
+    const self_buf_ptr = @intFromPtr(&output.buffer);
+    try std.testing.expectEqual(self_buf_ptr, writer_buf_ptr);
+    try std.testing.expectEqual(@as(usize, STDOUT_BUFFER_SIZE), output.writer.interface.buffer.len);
+}
+
+test "escapeJsonAlloc - escapes quote, backslash and control chars" {
+    const allocator = std.testing.allocator;
+
+    const input = "quote\"back\\slash\nnewline\ttab\x01";
+    const escaped = try escapeJsonAlloc(allocator, input);
+    defer allocator.free(escaped);
+
+    try std.testing.expectEqualStrings("quote\\\"back\\\\slash\\nnewline\\ttab\\u0001", escaped);
+}
+
+test "escapeJsonAlloc - plain utf-8 passes through" {
+    const allocator = std.testing.allocator;
+
+    const input = "norsk: æøå ✓ 日本語";
+    const escaped = try escapeJsonAlloc(allocator, input);
+    defer allocator.free(escaped);
+
+    try std.testing.expectEqualStrings(input, escaped);
 }
