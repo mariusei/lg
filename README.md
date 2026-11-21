@@ -31,7 +31,7 @@ brew install lg
 
 ### Manual Build
 
-Requires **Zig 0.16.0+** and the `utf8proc` system library (`brew install utf8proc`).
+Requires **Zig 0.17.0+** and the `utf8proc` system library (`brew install utf8proc`).
 
 ```bash
 make release              # or: zig build -Doptimize=ReleaseFast

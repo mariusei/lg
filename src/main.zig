@@ -55,6 +55,11 @@ pub fn main(init: std.process.Init) !void {
     try display.print(io, allocator, files, if (git_ctx) |*ctx| ctx else null, config);
 }
 
+/// Trim the trailing newline(s) git prints for `git branch --show-current`.
+fn parseBranchName(raw: []const u8) []const u8 {
+    return std.mem.trim(u8, raw, &std.ascii.whitespace);
+}
+
 fn showBranch(io: std.Io, allocator: std.mem.Allocator) !void {
     const result = try std.process.run(allocator, io, .{
         .argv = &.{ "git", "branch", "--show-current" },
@@ -62,7 +67,7 @@ fn showBranch(io: std.Io, allocator: std.mem.Allocator) !void {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    const branch = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    const branch = parseBranchName(result.stdout);
     if (branch.len > 0) {
         std.debug.print("Branch: {s}\n\n", .{branch});
     }
@@ -94,23 +99,11 @@ test "legend text documents all symbols" {
     try std.testing.expect(std.mem.indexOf(u8, legend_text, "Untracked") != null);
 }
 
-test "showBranch handles git failure gracefully" {
-    // Test that showBranch doesn't crash even if git fails
-    const allocator = std.testing.allocator;
-
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    // This may fail if not in a git repo, but shouldn't crash
-    showBranch(io, allocator) catch |err| {
-        // Expected errors when git is not available or not in a repo
-        try std.testing.expect(
-            err == error.FileNotFound or
-                err == error.BrokenPipe or
-                err == std.process.SpawnError.InvalidExe,
-        );
-    };
+test "parseBranchName trims git output" {
+    try std.testing.expectEqualStrings("main", parseBranchName("main\n"));
+    try std.testing.expectEqualStrings("feature/x", parseBranchName("feature/x\n\n"));
+    try std.testing.expectEqualStrings("", parseBranchName("\n"));
+    try std.testing.expectEqualStrings("", parseBranchName(""));
 }
 
 test "arena allocator cleanup" {

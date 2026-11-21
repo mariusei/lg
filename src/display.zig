@@ -3,12 +3,25 @@ const types = @import("types.zig");
 const colors = @import("colors.zig");
 const git = @import("git.zig");
 
-// libc is used to convert timestamps to the local timezone (matches `ls -l`),
-// including DST, via the system tz database.
-const c = @cImport({
-    @cInclude("time.h");
-    @cInclude("stdlib.h");
-});
+// libc externs for localtime conversion (matches `ls -l`), in place of @cImport
+// (removed in Zig 0.17). Layout matches Darwin and glibc struct tm.
+const time_t = c_long;
+const Tm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: ?[*:0]const u8,
+};
+extern fn localtime_r(timep: *const time_t, result: *Tm) callconv(.c) ?*Tm;
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) callconv(.c) c_int;
+extern fn tzset() callconv(.c) void;
 
 // Display configuration constants
 const STDOUT_BUFFER_SIZE = 4096; // Match typical page size for efficient I/O
@@ -536,9 +549,9 @@ fn formatTime(allocator: std.mem.Allocator, mtime: i128) ![]const u8 {
 
     // Convert to the local timezone via libc so output matches `ls -l`
     // (respects the active timezone and DST through the system tz database).
-    var time_val: c.time_t = @intCast(epoch_secs);
-    var tm_result: c.struct_tm = undefined;
-    if (c.localtime_r(&time_val, &tm_result) == null) return error.TimeConversionFailed;
+    var time_val: time_t = @intCast(epoch_secs);
+    var tm_result: Tm = undefined;
+    if (localtime_r(&time_val, &tm_result) == null) return error.TimeConversionFailed;
 
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     const month_name = month_names[@intCast(tm_result.tm_mon)];
@@ -670,7 +683,7 @@ fn printJson(allocator: std.mem.Allocator, files: []const types.FileInfo, output
                 escaped_name,
                 file.size,
                 file.mode & 0o7777,
-                @intFromEnum(file.git_status),
+                @backingInt(file.git_status),
             },
         );
     }
@@ -685,7 +698,7 @@ fn printPorcelain(files: []const types.FileInfo, output: *UnifiedOutput) !void {
             .{
                 file.mode & 0o7777,
                 file.size,
-                @intFromEnum(file.git_status),
+                @backingInt(file.git_status),
                 file.name,
             },
         );
@@ -914,8 +927,8 @@ test "formatPermissions - file rw-r--r--" {
 // Pin the timezone to UTC so formatTime tests are deterministic regardless of
 // the machine running them. formatTime now renders in local time via libc.
 fn forceUtcTimezone() void {
-    _ = c.setenv("TZ", "UTC", 1);
-    c.tzset();
+    _ = setenv("TZ", "UTC", 1);
+    tzset();
 }
 
 test "formatTime - epoch zero" {

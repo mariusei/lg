@@ -42,12 +42,12 @@ pub const Config = struct {
     dir_path: []const u8,
     detail_level: DetailLevel,
     output_format: OutputFormat,
-    show_all: bool,              // -a: Include hidden files (starting with .)
+    show_all: bool, // -a: Include hidden files (starting with .)
     sort_alphabetical: bool,
     show_branch: bool,
     show_legend: bool,
-    calc_dir_sizes: bool,        // -d: Run du -sk (slow on large dirs!)
-    group_by_type: bool,         // -t: Group dirs first, then by extension (adds blank lines)
+    calc_dir_sizes: bool, // -d: Run du -sk (slow on large dirs!)
+    group_by_type: bool, // -t: Group dirs first, then by extension (adds blank lines)
     file_filters: ?[]const []const u8,
     // Phase 1 flags
     reverse_order: bool,
@@ -55,16 +55,16 @@ pub const Config = struct {
     show_inodes: bool,
     sort_by_time: bool,
     // Phase 2 flags (Step 1)
-    file_type_indicators: bool,  // -F
-    append_dir_slash: bool,      // -p
-    one_column: bool,            // -1
-    unsorted: bool,              // -U
+    file_type_indicators: bool, // -F
+    append_dir_slash: bool, // -p
+    one_column: bool, // -1
+    unsorted: bool, // -U
     // Phase 2 flags (Step 2)
-    omit_group: bool,            // -o
-    omit_owner: bool,            // -g
-    sort_by_extension: bool,     // -X: Sort by file extension (like ls -X)
-    color: ColorMode = .auto,    // --color: when to emit ANSI colors
-    use_color: bool = false,     // Resolved at startup: color mode + isatty + NO_COLOR/TERM
+    omit_group: bool, // -o
+    omit_owner: bool, // -g
+    sort_by_extension: bool, // -X: Sort by file extension (like ls -X)
+    color: ColorMode = .auto, // --color: when to emit ANSI colors
+    use_color: bool = false, // Resolved at startup: color mode + isatty + NO_COLOR/TERM
 
     pub fn default() Config {
         return .{
@@ -290,9 +290,9 @@ test "FileInfo can be constructed" {
 }
 
 test "GitStatus enum discriminants match char values" {
-    try std.testing.expectEqual(@as(u8, ' '), @intFromEnum(FileInfo.GitStatus.clean));
-    try std.testing.expectEqual(@as(u8, 'M'), @intFromEnum(FileInfo.GitStatus.staged_modified));
-    try std.testing.expectEqual(@as(u8, 'm'), @intFromEnum(FileInfo.GitStatus.unstaged_modified));
-    try std.testing.expectEqual(@as(u8, '?'), @intFromEnum(FileInfo.GitStatus.untracked));
-    try std.testing.expectEqual(@as(u8, '!'), @intFromEnum(FileInfo.GitStatus.ignored));
+    try std.testing.expectEqual(@as(u8, ' '), @backingInt(FileInfo.GitStatus.clean));
+    try std.testing.expectEqual(@as(u8, 'M'), @backingInt(FileInfo.GitStatus.staged_modified));
+    try std.testing.expectEqual(@as(u8, 'm'), @backingInt(FileInfo.GitStatus.unstaged_modified));
+    try std.testing.expectEqual(@as(u8, '?'), @backingInt(FileInfo.GitStatus.untracked));
+    try std.testing.expectEqual(@as(u8, '!'), @backingInt(FileInfo.GitStatus.ignored));
 }

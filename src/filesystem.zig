@@ -1,9 +1,12 @@
 const std = @import("std");
 const types = @import("types.zig");
 const git = @import("git.zig");
-const c = @cImport({
-    @cInclude("utf8proc.h");
-});
+
+// Extern declarations for utf8proc (used instead of @cImport, which was
+// removed in Zig 0.17). Only the three symbols we need.
+const utf8proc_uint8_t = u8;
+extern fn utf8proc_NFC(str: [*c]const utf8proc_uint8_t) callconv(.c) [*c]utf8proc_uint8_t;
+extern fn free(ptr: [*c]utf8proc_uint8_t) callconv(.c) void;
 
 /// Compare two UTF-8 strings, handling macOS NFD/NFC normalization differences.
 /// Returns true if strings are equivalent using Unicode NFC normalization.
@@ -17,15 +20,15 @@ fn utf8Equal(a: []const u8, b: []const u8) bool {
 
     // Normalize both strings to NFC for comparison
     // utf8proc_NFC returns a malloc'd string that must be freed
-    const a_nfc = c.utf8proc_NFC(a.ptr);
+    const a_nfc = utf8proc_NFC(a.ptr);
     if (a_nfc == null) return false;
-    defer c.free(a_nfc);
+    defer free(a_nfc);
 
-    const b_nfc = c.utf8proc_NFC(b.ptr);
+    const b_nfc = utf8proc_NFC(b.ptr);
     if (b_nfc == null) {
         return false;
     }
-    defer c.free(b_nfc);
+    defer free(b_nfc);
 
     // Compare normalized strings
     // Both are null-terminated C strings
