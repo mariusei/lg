@@ -666,7 +666,7 @@ fn clockTime(buf: *[5]u8, epoch_secs: i64) ![]const u8 {
 
 /// Format mtime for the Modified column.
 /// Younger than 7 days: compact relative time with wall-clock time
-/// ("• 15m 08:00", "3t 14:32", "6d 09:05"; t = timer). The bullet marks
+/// ("* 15m 08:00", "3t 14:32", "6d 09:05"; t = timer). The star marks
 /// files changed within the last 24h. Older (or future mtime): absolute
 /// "Mon DD HH:MM". Result is right-padded to a visual width of 12 (the
 /// width of the absolute format) so the name column stays aligned.
@@ -688,7 +688,7 @@ fn formatTimeRel(allocator: std.mem.Allocator, mtime: i128, now_secs: i64) ![]co
         const hm = try clockTime(&hm_buf, @intCast(epoch_secs));
 
         const core = if (age < 86400)
-            try std.fmt.allocPrint(allocator, "• {s} {s}", .{ body, hm })
+            try std.fmt.allocPrint(allocator, "* {s} {s}", .{ body, hm })
         else
             try std.fmt.allocPrint(allocator, "{s} {s}", .{ body, hm });
         defer allocator.free(core);
@@ -1212,7 +1212,7 @@ test "formatTimeRel - minutes ago carries bullet marker" {
     defer allocator.free(str);
 
     // 2027-01-15 08:00 UTC minus 15 min = 07:45; UTC pinned by forceUtcTimezone
-    try std.testing.expectEqualStrings("• 15m 07:45 ", str);
+    try std.testing.expectEqualStrings("* 15m 07:45 ", str);
     try std.testing.expectEqual(@as(usize, 12), visualLength(str));
 }
 
@@ -1225,7 +1225,7 @@ test "formatTimeRel - hours ago carries bullet marker" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    try std.testing.expectEqualStrings("• 3t 05:00  ", str);
+    try std.testing.expectEqualStrings("* 3t 05:00  ", str);
     try std.testing.expectEqual(@as(usize, 12), visualLength(str));
 }
 
@@ -1252,7 +1252,7 @@ test "formatTimeRel - under a day boundary keeps hours, not days" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    try std.testing.expectEqualStrings("• 23t 08:01 ", str);
+    try std.testing.expectEqualStrings("* 23t 08:01 ", str);
 }
 
 test "formatTimeRel - 7 days or older falls back to absolute" {
@@ -1266,7 +1266,7 @@ test "formatTimeRel - 7 days or older falls back to absolute" {
 
     // Falls back to the absolute format; exact date depends on tz, so just
     // check it is not a relative string.
-    try std.testing.expect(std.mem.indexOf(u8, str, "•") == null);
+    try std.testing.expect(std.mem.indexOf(u8, str, "*") == null);
     try std.testing.expectEqual(@as(usize, 12), str.len);
 }
 
@@ -1279,7 +1279,7 @@ test "formatTimeRel - future mtime falls back to absolute" {
     const str = try formatTimeRel(allocator, mtime, now);
     defer allocator.free(str);
 
-    try std.testing.expect(std.mem.indexOf(u8, str, "•") == null);
+    try std.testing.expect(std.mem.indexOf(u8, str, "*") == null);
 }
 
 test "calculateSizeStats - empty array" {
