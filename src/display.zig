@@ -215,8 +215,31 @@ fn printNormal(
         );
     }
 
+    // Scenario D: total size line when -d is active. Suppressed in one-column
+    // mode, where stdout must stay machine-consumable names-only.
+    // With -d the "." row carries du(cwd), which already includes everything
+    // below it; summing all rows would double-count. Fall back to summing the
+    // rows if no "." entry exists.
+    if (config.calc_dir_sizes and !config.one_column) {
+        var sum: u64 = 0;
+        var dot_total: ?u64 = null;
+        for (files) |file| {
+            sum +|= file.size;
+            if (std.mem.eql(u8, file.name, ".")) dot_total = file.size;
+        }
+        const total = dot_total orelse sum;
+        var size_buf: [32]u8 = undefined;
+        const size_str = std.mem.trimStart(u8, try formatSizeInto(&size_buf, total, false, true), " ");
+        const dim = if (config.use_color) colors.dim else "";
+        const reset = if (config.use_color) colors.reset else "";
+        try output.print("{s}Total: {s}{s}\n", .{ dim, size_str, reset });
+    }
+
     // Scenario C: one-line git summary at the bottom of the listing.
-    if (git_ctx) |ctx| try printGitSummary(ctx, config, output);
+    // Suppressed in one-column mode for the same reason.
+    if (!config.one_column) {
+        if (git_ctx) |ctx| try printGitSummary(ctx, config, output);
+    }
 }
 
 /// Print a one-line summary of staged/unstaged/untracked counts and, when
