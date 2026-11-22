@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  ZIG_VERSION: "0.17.1"
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux,   os: ubuntu-latest, zig_target: x86_64-linux-0.17.1,  sha: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a, ext: tar.xz }
+          - { name: macos,   os: macos-latest,  zig_target: aarch64-macos-0.17.1, sha: 75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d, ext: tar.xz }
+          - { name: windows, os: windows-latest, zig_target: x86_64-windows-0.17.1, sha: b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e, ext: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_target }}.${{ matrix.ext }}"
+          curl -fSL "$url" -o "zig.${{ matrix.ext }}"
+          echo "${{ matrix.sha }}  zig.${{ matrix.ext }}" | shasum -a 256 -c -
+          tar -xf "zig.${{ matrix.ext }}"
+          mv "zig-${{ matrix.zig_target }}" zig
+          echo "$PWD/zig" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=./zig-out/bin/lg
+          [ "${{ runner.os }}" = "Windows" ] && bin=./zig-out/bin/lg.exe
+          "$bin" --version
+          "$bin" --json > /dev/null
+          "$bin" --porcelain -z > /dev/null
+          "$bin" | head -3
+
+  package:
+    name: package (${{ matrix.name }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,  os: ubuntu-latest, target: x86_64-linux-musl,   artifact: lg-linux-x86_64.tar.gz }
+          - { name: linux-aarch64, os: ubuntu-latest, target: aarch64-linux-musl,  artifact: lg-linux-aarch64.tar.gz }
+          - { name: windows-x86_64, os: ubuntu-latest, target: x86_64-windows-gnu, artifact: lg-windows-x86_64.zip }
+          - { name: windows-aarch64, os: ubuntu-latest, target: aarch64-windows-gnu, artifact: lg-windows-aarch64.zip }
+          - { name: macos-aarch64, os: macos-latest,  target: aarch64-macos,       artifact: lg-macos-aarch64.tar.gz }
+          - { name: macos-x86_64,  os: macos-latest,  target: x86_64-macos,        artifact: lg-macos-x86_64.tar.gz }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-windows-${ZIG_VERSION}.zip"
+            curl -fSL "$url" -o zig.zip
+            echo "b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e  zig.zip" | shasum -a 256 -c -
+            tar -xf zig.zip
+            mv "zig-x86_64-windows-${ZIG_VERSION}" zig
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+            curl -fSL "$url" -o zig.tar.xz
+            echo "75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d  zig.tar.xz" | shasum -a 256 -c -
+            tar -xf zig.tar.xz
+            mv "zig-aarch64-macos-${ZIG_VERSION}" zig
+          else
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+            curl -fSL "$url" -o zig.tar.xz
+            echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  zig.tar.xz" | shasum -a 256 -c -
+            tar -xf zig.tar.xz
+            mv "zig-x86_64-linux-${ZIG_VERSION}" zig
+          fi
+          echo "$PWD/zig" >> "$GITHUB_PATH"
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} --prefix "dist/${{ matrix.name }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pkg
+          cp "dist/${{ matrix.name }}/bin/lg"* pkg/ 2>/dev/null || cp "dist/${{ matrix.name }}/bin/lg.exe" pkg/
+          cp README.md LICENSE* pkg/ 2>/dev/null || cp README.md pkg/
+          if [[ "${{ matrix.artifact }}" == *.zip ]]; then
+            python3 -c "import shutil; shutil.make_archive('${{ matrix.artifact%.zip }}', 'zip', 'pkg')"
+          else
+            tar -czf "${{ matrix.artifact }}" -C pkg .
+          fi
+          shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten
+        shell: bash
+        run: |
+          mkdir -p upload
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec mv {} upload/ \;
+          ls -la upload
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" upload/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

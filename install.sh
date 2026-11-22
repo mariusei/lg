@@ -18,25 +18,6 @@ echo -e "${GREEN}lg installer${NC}"
 echo "OS: $OS ($ARCH)"
 echo ""
 
-# Check if utf8proc is installed
-check_utf8proc() {
-    if command -v pkg-config >/dev/null 2>&1; then
-        if pkg-config --exists libutf8proc; then
-            echo -e "${GREEN}✓${NC} utf8proc found"
-            return 0
-        fi
-    fi
-
-    # Check homebrew location
-    if [ -f "/opt/homebrew/lib/libutf8proc.dylib" ] || [ -f "/usr/local/lib/libutf8proc.dylib" ]; then
-        echo -e "${GREEN}✓${NC} utf8proc found (homebrew)"
-        return 0
-    fi
-
-    echo -e "${YELLOW}⚠${NC} utf8proc not found"
-    return 1
-}
-
 # Check if Zig is installed
 check_zig() {
     if command -v zig >/dev/null 2>&1; then
@@ -56,10 +37,6 @@ install_deps_macos() {
     fi
 
     echo "Installing dependencies via Homebrew..."
-
-    if ! check_utf8proc; then
-        brew install utf8proc
-    fi
 
     if ! check_zig; then
         echo "Installing Zig..."
@@ -151,22 +128,18 @@ check_path() {
 
 # Main installation flow
 main() {
-    # Check dependencies
+    # Check dependencies (only Zig is required; utf8proc is vendored)
     if [ "$OS" = "Darwin" ]; then
-        if ! check_utf8proc; then
+        if ! check_zig; then
             echo ""
-            echo "utf8proc is required. Install it?"
-            read -p "Install dependencies via Homebrew? [Y/n] " -n 1 -r
+            read -p "Install Zig via Homebrew? [Y/n] " -n 1 -r
             echo
             if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
                 install_deps_macos
             else
-                echo "Please install utf8proc manually:"
-                echo "  brew install utf8proc"
+                echo "Please install Zig 0.17.0+: https://ziglang.org/download/"
                 exit 1
             fi
-        else
-            check_utf8proc
         fi
     fi
 

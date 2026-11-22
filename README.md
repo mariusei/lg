@@ -29,9 +29,25 @@ brew tap mariusei/tap
 brew install lg
 ```
 
+### Prebuilt Binaries (macOS, Linux, Windows)
+
+Download from [GitHub Releases](https://github.com/mariusei/lg/releases) and unpack. No dependencies to install:
+
+```bash
+# Linux (x86_64 shown; aarch64 also available, static musl builds)
+curl -L https://github.com/mariusei/lg/releases/latest/download/lg-linux-x86_64.tar.gz | tar xz
+sudo install -m 0755 lg /usr/local/bin/lg
+
+# macOS (Apple Silicon shown; Intel also available)
+curl -L https://github.com/mariusei/lg/releases/latest/download/lg-macos-aarch64.tar.gz | tar xz
+sudo install -m 0755 lg /usr/local/bin/lg
+```
+
+On Windows, download `lg-windows-x86_64.zip`, unpack and put `lg.exe` on your `PATH`. `lg` uses UTF-8 output and ANSI colors, which work in modern Windows Terminal.
+
 ### Manual Build
 
-Requires **Zig 0.17.0+** and the `utf8proc` system library (`brew install utf8proc`).
+Requires **Zig 0.17.0+**. No other dependencies — utf8proc is vendored.
 
 ```bash
 make release              # or: zig build -Doptimize=ReleaseFast
@@ -146,9 +162,9 @@ Considered alternatives:
 - ❌ **Manual implementation**: Only covered ~50 Latin characters, brittle
 - ❌ **ICU**: 10-30MB overhead, massive overkill
 - ❌ **ziglyph/zg**: Not yet compatible with Zig 0.15
-- ✅ **utf8proc**:
+- ✅ **utf8proc** (vendored, see `vendor/utf8proc/`):
   - 100% Unicode coverage
-  - ~400KB shared library
+  - ~400KB compiled in, no system dependency
   - Battle-tested (Julia, PostgreSQL, Apache Arrow)
   - Simple C API
   - MIT licensed
