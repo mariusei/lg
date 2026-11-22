@@ -107,10 +107,11 @@ jobs:
           mkdir -p pkg
           cp "dist/${{ matrix.name }}/bin/lg"* pkg/ 2>/dev/null || cp "dist/${{ matrix.name }}/bin/lg.exe" pkg/
           cp README.md LICENSE* pkg/ 2>/dev/null || cp README.md pkg/
-          if [[ "${{ matrix.artifact }}" == *.zip ]]; then
-            python3 -c "import shutil; shutil.make_archive('${{ matrix.artifact%.zip }}', 'zip', 'pkg')"
+          artifact='${{ matrix.artifact }}'
+          if [[ "$artifact" == *.zip ]]; then
+            python3 -c "import shutil,sys; shutil.make_archive(sys.argv[1], 'zip', 'pkg')" "${artifact%.zip}"
           else
-            tar -czf "${{ matrix.artifact }}" -C pkg .
+            tar -czf "$artifact" -C pkg .
           fi
           shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
 
