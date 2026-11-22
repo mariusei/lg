@@ -8,12 +8,16 @@ const std = @import("std");
 const types = @import("types.zig");
 const cli = @import("cli.zig");
 const git = @import("git.zig");
+const wincon = @import("wincon.zig");
 
 // Import filesystem and display modules
 const filesystem = @import("filesystem.zig");
 const display = @import("display.zig");
 
 pub fn main(init: std.process.Init) !void {
+    // Make stdout render ANSI colors and UTF-8 correctly on Windows; no-op elsewhere.
+    wincon.enableVirtualTerminal();
+
     const io = init.io;
 
     // Arena allocator: all allocations freed with single deinit()

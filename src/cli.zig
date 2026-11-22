@@ -5,6 +5,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const display = @import("display.zig");
+const wincon = @import("wincon.zig");
 const build_options = @import("build_options");
 
 /// Version string, injected from build.zig.zon via build.zig.
@@ -200,7 +201,7 @@ fn resolveColor(mode: types.ColorMode) bool {
         .always => true,
         .never => false,
         .auto => blk: {
-            const is_tty = std.c.isatty(1) != 0; // stdout
+            const is_tty = wincon.stdoutIsTty();
             const no_color: ?[]const u8 = if (std.c.getenv("NO_COLOR")) |p| std.mem.span(p) else null;
             const term: ?[]const u8 = if (std.c.getenv("TERM")) |p| std.mem.span(p) else null;
             break :blk colorAllowed(is_tty, no_color, term);

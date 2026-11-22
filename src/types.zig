@@ -18,7 +18,6 @@ pub const STDOUT_BUFFER_SIZE = 512;
 pub const GIT_STATUS_MAX_OUTPUT = 1024 * 1024;
 
 /// Max output size for du command (10MB for large directory trees)
-pub const DU_MAX_OUTPUT = 10 * 1024 * 1024;
 
 pub const ColorMode = enum {
     auto,
@@ -46,7 +45,7 @@ pub const Config = struct {
     sort_alphabetical: bool,
     show_branch: bool,
     show_legend: bool,
-    calc_dir_sizes: bool, // -d: Run du -sk (slow on large dirs!)
+    calc_dir_sizes: bool, // -d: Recursively sum directory sizes (slow on large trees)
     group_by_type: bool, // -t: Group dirs first, then by extension (adds blank lines)
     file_filters: ?[]const []const u8,
     // Phase 1 flags
@@ -108,11 +107,11 @@ pub const Anomaly = packed struct(u8) {
 
 pub const FileInfo = struct {
     name: []const u8,
-    mode: std.posix.mode_t,
+    mode: u32,
     size: u64,
     mtime: i128,
-    uid: std.posix.uid_t,
-    gid: std.posix.gid_t,
+    uid: u32,
+    gid: u32,
     git_status: GitStatus,
     kind: FileKind,
     inode: u64,

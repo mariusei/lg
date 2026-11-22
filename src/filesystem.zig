@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const git = @import("git.zig");
 
@@ -40,12 +41,22 @@ fn utf8Equal(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a_nfc[0..a_len], b_nfc[0..b_len]);
 }
 
-/// Stat a path relative to a directory fd via libc `fstatat`.
-///
-/// Zig 0.16 removed `std.posix.fstatat`; the high-level `std.Io.File.Stat` no
-/// longer exposes uid/gid/mode, which this tool needs. We therefore call libc
-/// `fstatat` directly and keep the raw `std.c.Stat` (which has .mode/.uid/.gid/
-/// .ino/.size and an mtime() accessor), preserving the previous behavior.
+// ─── Platform-specific stat ─────────────────────────────────────────────
+// Linux: raw statx syscall (glibc/musl both support it; std.c.Stat is void
+//        on linux in Zig 0.17).
+// macOS/other POSIX: libc fstatat — x86_64 needs the legacy $INODE64
+//        symbol, so we declare our own.
+// Windows: std.Io.Dir.statFile (GetFileInformationByHandle under the hood);
+//        uid/gid don't exist there and mode is synthesized from the
+//        readonly attribute and the file extension for executables.
+
+extern "c" fn fstatat(dirfd: std.posix.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flags: u32) c_int;
+extern "c" fn @"fstatat$INODE64"(dirfd: std.posix.fd_t, path: [*:0]const u8, buf: *std.c.Stat, flags: u32) c_int;
+const c_fstatat = if (builtin.os.tag == .macos and builtin.cpu.arch == .x86_64)
+    @"fstatat$INODE64"
+else
+    fstatat;
+
 fn cFstatat(dirfd: std.posix.fd_t, path: []const u8, flags: u32) !std.c.Stat {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= path_buf.len) return error.NameTooLong;
@@ -54,7 +65,7 @@ fn cFstatat(dirfd: std.posix.fd_t, path: []const u8, flags: u32) !std.c.Stat {
     const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
     var stat_buf: std.c.Stat = undefined;
-    const rc = std.c.fstatat(dirfd, path_z, &stat_buf, flags);
+    const rc = c_fstatat(dirfd, path_z, &stat_buf, flags);
     if (rc != 0) {
         return switch (std.posix.errno(rc)) {
             .NOENT => error.FileNotFound,
@@ -68,22 +79,97 @@ fn cFstatat(dirfd: std.posix.fd_t, path: []const u8, flags: u32) !std.c.Stat {
     return stat_buf;
 }
 
-/// Check whether a regular file starts with "#!".
-/// Returns true on any read failure: we only flag files we positively
-/// inspected, to avoid false positives on unreadable executables.
-fn hasShebang(dirfd: std.posix.fd_t, name: []const u8) bool {
+/// Normalized per-entry metadata, filled by statEntry on every platform.
+const StatInfo = struct {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    executable: bool,
+};
+
+fn linuxStatEntry(dirfd: std.posix.fd_t, name: []const u8, follow: bool) !StatInfo {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (name.len >= path_buf.len) return true;
+    if (name.len >= path_buf.len) return error.NameTooLong;
     @memcpy(path_buf[0..name.len], name);
     path_buf[name.len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-    const fd = std.c.openat(dirfd, path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (fd < 0) return true;
-    defer _ = std.c.close(fd);
+    var stx: std.os.linux.Statx = undefined;
+    const flags: u32 = if (follow) 0 else std.os.linux.AT.SYMLINK_NOFOLLOW;
+    const rc = std.os.linux.statx(@intCast(dirfd), path_z, flags, std.os.linux.STATX.BASIC_STATS, &stx);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        .NOENT => return error.FileNotFound,
+        .ACCES => return error.AccessDenied,
+        .NOTDIR => return error.NotDir,
+        .LOOP => return error.SymLinkLoop,
+        .NAMETOOLONG => return error.NameTooLong,
+        else => return error.StatFailed,
+    }
+    return .{
+        .mode = stx.mode,
+        .uid = stx.uid,
+        .gid = stx.gid,
+        .ino = stx.ino,
+        .size = stx.size,
+        .mtime_ns = @as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec,
+        .executable = (stx.mode & 0o111) != 0,
+    };
+}
 
+fn statEntry(io: std.Io, dir: std.Io.Dir, name: []const u8, follow: bool) !StatInfo {
+    if (comptime builtin.os.tag == .windows) {
+        const st = try dir.statFile(io, name, .{ .follow_symlinks = follow });
+        const is_exec = st.kind == .file and hasExecutableExtension(name);
+        const readonly = (@as(u32, @intFromEnum(st.permissions)) & 1) != 0; // FILE_ATTRIBUTE_READONLY
+        var mode: u32 = if (st.kind == .directory) 0o755 else if (readonly) 0o444 else 0o666;
+        if (is_exec) mode |= 0o111;
+        return .{
+            .mode = mode,
+            .uid = 0,
+            .gid = 0,
+            .ino = @intCast(st.inode),
+            .size = st.size,
+            .mtime_ns = @intCast(st.mtime.nanoseconds),
+            .executable = is_exec,
+        };
+    } else if (comptime builtin.os.tag == .linux) {
+        return linuxStatEntry(dir.handle, name, follow);
+    } else {
+        const st = try cFstatat(dir.handle, name, if (follow) 0 else std.posix.AT.SYMLINK_NOFOLLOW);
+        const mtime_ts = st.mtime();
+        return .{
+            .mode = @intCast(st.mode),
+            .uid = @intCast(st.uid),
+            .gid = @intCast(st.gid),
+            .ino = @intCast(st.ino),
+            .size = if (st.size < 0) 0 else @min(@as(u64, @intCast(st.size)), std.math.maxInt(u64)),
+            .mtime_ns = @as(i128, mtime_ts.sec) * std.time.ns_per_s + mtime_ts.nsec,
+            .executable = (st.mode & 0o111) != 0,
+        };
+    }
+}
+
+fn hasExecutableExtension(name: []const u8) bool {
+    const ext = std.fs.path.extension(name);
+    const execs = [_][]const u8{ ".exe", ".com", ".bat", ".cmd", ".ps1" };
+    for (execs) |e| {
+        if (ext.len == e.len and std.ascii.eqlIgnoreCase(ext, e)) return true;
+    }
+    return false;
+}
+
+/// Check whether a regular file starts with "#!".
+/// Returns true on any read failure: we only flag files we positively
+/// inspected, to avoid false positives on unreadable executables.
+fn hasShebang(io: std.Io, dir: std.Io.Dir, name: []const u8) bool {
+    const file = dir.openFile(io, name, .{}) catch return true;
+    defer file.close(io);
     var buf: [2]u8 = undefined;
-    const n = std.c.read(fd, &buf, buf.len);
+    const n = file.readStreaming(io, &.{&buf}) catch return true;
     if (n < 2) return false;
     return buf[0] == '#' and buf[1] == '!';
 }
@@ -104,39 +190,29 @@ pub fn listFiles(
         list.deinit(allocator);
     }
 
+    // Open directory
+    var dir = try std.Io.Dir.cwd().openDir(io, config.dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
     // Add current directory entry when -d is used (like C version)
     if (config.calc_dir_sizes) {
-        const dir_stat = cFstatat(std.posix.AT.FDCWD, config.dir_path, 0) catch |err| {
+        const root_stat = statEntry(io, dir, ".", false) catch |err| {
             std.debug.print("Error: couldn't stat directory '{s}': {}\n", .{ config.dir_path, err });
             return err;
         };
 
-        const mtime_ts = dir_stat.mtime();
-        const mtime_ns = @as(i128, mtime_ts.sec) * std.time.ns_per_s + mtime_ts.nsec;
-
-        // Calculate current directory size
-        var dir_size: u64 = 0;
-        if (config.calc_dir_sizes) {
-            // We'll calculate this size later in batch
-            dir_size = 0;
-        }
-
         try list.append(allocator, .{
             .name = try allocator.dupe(u8, "."),
-            .mode = dir_stat.mode,
-            .size = dir_size,
-            .mtime = mtime_ns,
-            .uid = dir_stat.uid,
-            .gid = dir_stat.gid,
+            .mode = root_stat.mode,
+            .size = 0, // filled in later by calculateDirSizes
+            .mtime = root_stat.mtime_ns,
+            .uid = root_stat.uid,
+            .gid = root_stat.gid,
             .git_status = .clean, // Current dir doesn't have git status
             .kind = .directory,
-            .inode = dir_stat.ino,
+            .inode = root_stat.ino,
         });
     }
-
-    // Open directory
-    var dir = try std.Io.Dir.cwd().openDir(io, config.dir_path, .{ .iterate = true });
-    defer dir.close(io);
 
     // Iterate entries
     var iter = dir.iterate();
@@ -159,9 +235,8 @@ pub fn listFiles(
             if (!match) continue;
         }
 
-        // Get file metadata using fstatat to get uid/gid
-        // Use SYMLINK_NOFOLLOW to prevent symlink loop attacks
-        const posix_stat = cFstatat(dir.handle, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
+        // Get file metadata (symlinks not followed: prevents symlink loop attacks)
+        const st = statEntry(io, dir, entry.name, false) catch |err| {
             // Skip files we can't stat
             std.debug.print("Warning: couldn't stat {s}: {}\n", .{ entry.name, err });
             continue;
@@ -177,7 +252,7 @@ pub fn listFiles(
         const kind: types.FileInfo.FileKind = switch (entry.kind) {
             .directory => .directory,
             .sym_link => .symlink,
-            .file => .{ .file = .{ .executable = (posix_stat.mode & 0o111) != 0 } },
+            .file => .{ .file = .{ .executable = st.executable } },
             else => continue, // Skip special files (device, named_pipe, etc.)
         };
 
@@ -186,35 +261,31 @@ pub fn listFiles(
         var anomalies = types.Anomaly{};
         switch (kind) {
             .symlink => {
-                // The stat above used SYMLINK_NOFOLLOW; follow the link now to
+                // The stat above did not follow the link; follow it now to
                 // detect dangling targets.
-                _ = cFstatat(dir.handle, entry.name, 0) catch {
+                _ = statEntry(io, dir, entry.name, true) catch {
                     anomalies.broken_symlink = true;
                 };
             },
             .file => |f| {
-                if (posix_stat.size == 0) anomalies.empty_file = true;
-                if (f.executable and !hasShebang(dir.handle, entry.name)) {
+                if (st.size == 0) anomalies.empty_file = true;
+                if (f.executable and !hasShebang(io, dir, entry.name)) {
                     anomalies.exec_without_shebang = true;
                 }
             },
             .directory => {},
         }
 
-        const mtime_ts = posix_stat.mtime();
-        const mtime_ns = @as(i128, mtime_ts.sec) * std.time.ns_per_s + mtime_ts.nsec;
-
         try list.append(allocator, .{
             .name = try allocator.dupe(u8, entry.name),
-            .mode = posix_stat.mode,
-            // Protect against integer overflow: saturate at max u64 instead of wrapping
-            .size = if (posix_stat.size < 0) 0 else @min(@as(u64, @intCast(posix_stat.size)), std.math.maxInt(u64)),
-            .mtime = mtime_ns,
-            .uid = posix_stat.uid,
-            .gid = posix_stat.gid,
+            .mode = st.mode,
+            .size = st.size,
+            .mtime = st.mtime_ns,
+            .uid = st.uid,
+            .gid = st.gid,
             .git_status = git_status,
             .kind = kind,
-            .inode = posix_stat.ino,
+            .inode = st.ino,
             .anomalies = anomalies,
         });
     }
@@ -227,117 +298,51 @@ pub fn listFiles(
     return list.toOwnedSlice(allocator);
 }
 
-/// Validate path for security - prevents command injection and flag confusion.
-/// Returns error.InvalidPath if path contains dangerous patterns.
-/// Note: We use std.process.Child with array args (not shell execution),
-/// so most shell metacharacters are safe. We only reject truly dangerous patterns.
-fn validatePath(path: []const u8) !void {
-    // Reject null bytes (path truncation attacks)
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
-
-    // Reject paths starting with - (could be interpreted as flags by du)
-    if (path.len > 0 and path[0] == '-') return error.InvalidPath;
-
-    return;
-}
-
-/// Calculate directory sizes using `du -sk` in batch.
-/// Much faster than calling du once per directory.
+/// Calculate directory sizes natively (no external `du`).
+/// Sums the logical size of regular files; symlinks are not followed.
 fn calculateDirSizes(
     io: std.Io,
     allocator: std.mem.Allocator,
     base_path: []const u8,
     files: []types.FileInfo,
 ) !void {
-    // Collect all directory paths
-    var dir_paths: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (dir_paths.items) |path| allocator.free(path);
-        dir_paths.deinit(allocator);
+    for (files) |*file| {
+        if (file.kind != .directory) continue;
+
+        const full_path = if (std.mem.eql(u8, file.name, "."))
+            try allocator.dupe(u8, base_path)
+        else
+            try std.fs.path.join(allocator, &.{ base_path, file.name });
+        defer allocator.free(full_path);
+
+        var dir = std.Io.Dir.cwd().openDir(io, full_path, .{ .iterate = true }) catch |err| {
+            std.debug.print("Warning: couldn't open {s} for size calculation: {}\n", .{ full_path, err });
+            continue;
+        };
+        defer dir.close(io);
+        file.size = dirSizeWalk(io, dir);
     }
+}
 
-    for (files) |file| {
-        if (file.kind == .directory) {
-            // Handle "." specially - use base_path directly
-            const full_path = if (std.mem.eql(u8, file.name, "."))
-                try allocator.dupe(u8, base_path)
-            else
-                try std.fs.path.join(allocator, &.{ base_path, file.name });
-
-            // Validate path before passing to subprocess to prevent command injection
-            try validatePath(full_path);
-
-            try dir_paths.append(allocator, full_path);
+/// Recursively sum the size of regular files under `dir`.
+fn dirSizeWalk(io: std.Io, dir: std.Io.Dir) u64 {
+    var total: u64 = 0;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                total += dirSizeWalk(io, sub);
+            },
+            .file => {
+                const st = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
+                total += st.size;
+            },
+            else => {},
         }
     }
-
-    if (dir_paths.items.len == 0) return;
-
-    // Build args: ["du", "-sk", path1, path2, ...]
-    var args: std.ArrayList([]const u8) = .empty;
-    defer args.deinit(allocator);
-
-    try args.append(allocator, "du");
-    try args.append(allocator, "-sk");
-    try args.appendSlice(allocator, dir_paths.items);
-
-    // Execute du
-    // du is typically fast, and OS has its own timeout mechanisms
-    const run_result = std.process.run(allocator, io, .{
-        .argv = args.items,
-        .stdout_limit = .limited(types.DU_MAX_OUTPUT),
-    }) catch |err| {
-        return err;
-    };
-    const stdout = run_result.stdout;
-    defer allocator.free(stdout);
-    defer allocator.free(run_result.stderr);
-
-    // Check exit status
-    switch (run_result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                // du failed, but we can continue - just won't have dir sizes
-                return;
-            }
-        },
-        else => {
-            // Process was terminated/killed, skip dir size calculation
-            return;
-        },
-    }
-
-    // Parse output: "SIZE\tPATH\n"
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-
-        // Split on tab or space
-        var parts = std.mem.splitAny(u8, line, " \t");
-        const size_str = parts.next() orelse continue;
-        const path = parts.rest();
-
-        const size_kb = std.fmt.parseInt(u64, size_str, 10) catch continue;
-
-        // Find matching file entry and update size
-        for (files) |*file| {
-            if (file.kind != .directory) continue;
-
-            // Handle "." specially
-            const full_path = if (std.mem.eql(u8, file.name, "."))
-                try allocator.dupe(u8, base_path)
-            else
-                try std.fs.path.join(allocator, &.{ base_path, file.name });
-            defer allocator.free(full_path);
-
-            if (std.mem.eql(u8, full_path, path)) {
-                // Protect against integer overflow: use saturating multiplication
-                const size_bytes = std.math.mul(u64, size_kb, 1024) catch std.math.maxInt(u64);
-                file.size = size_bytes;
-                break;
-            }
-        }
-    }
+    return total;
 }
 
 /// Sort files based on config options.

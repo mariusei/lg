@@ -3,10 +3,21 @@ const types = @import("types.zig");
 const colors = @import("colors.zig");
 const git = @import("git.zig");
 
-// libc externs for localtime conversion (matches `ls -l`), in place of @cImport
-// (removed in Zig 0.17). Layout matches Darwin and glibc struct tm.
-const time_t = c_long;
-const Tm = extern struct {
+const builtin = @import("builtin");
+
+// Local wall-clock time via libc (matches `ls -l`). Windows and POSIX have
+// different struct tm / function signatures; handled per-platform.
+const Tm = if (builtin.os.tag == .windows) extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+} else extern struct {
     tm_sec: c_int,
     tm_min: c_int,
     tm_hour: c_int,
@@ -19,10 +30,24 @@ const Tm = extern struct {
     tm_gmtoff: c_long,
     tm_zone: ?[*:0]const u8,
 };
-extern fn localtime_r(timep: *const time_t, result: *Tm) callconv(.c) ?*Tm;
-extern fn time(tloc: ?*time_t) callconv(.c) time_t;
+extern fn localtime_r(timep: *const i64, result: *Tm) callconv(.c) ?*Tm;
+extern fn _localtime64_s(result: *Tm, timep: *const i64) callconv(.c) c_int;
+extern fn time(tloc: ?*i64) callconv(.c) i64;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) callconv(.c) c_int;
 extern fn tzset() callconv(.c) void;
+extern fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) callconv(.c) c_int;
+extern fn _tzset() callconv(.c) void;
+
+/// Fill `tm` with the local wall-clock breakdown of epoch seconds.
+fn localTm(epoch_secs: i64, tm: *Tm) error{TimeConversionFailed}!void {
+    if (comptime builtin.os.tag == .windows) {
+        var t = epoch_secs;
+        if (_localtime64_s(tm, &t) != 0) return error.TimeConversionFailed;
+    } else {
+        var t = epoch_secs;
+        if (localtime_r(&t, tm) == null) return error.TimeConversionFailed;
+    }
+}
 
 // Display configuration constants
 const STDOUT_BUFFER_SIZE = 4096; // Match typical page size for efficient I/O
@@ -447,7 +472,7 @@ fn printFileEntry(
     const reset = if (use_color and git_color.len > 0 and !std.mem.eql(u8, git_color, colors.reset)) colors.reset else "";
 
     // Format time
-    const now_secs: i64 = @intCast(time(null));
+    const now_secs: i64 = time(null);
     const time_str = try formatTimeRel(allocator, file.mtime, now_secs);
     defer allocator.free(time_str);
 
@@ -632,9 +657,8 @@ fn formatTime(allocator: std.mem.Allocator, mtime: i128) ![]const u8 {
 
     // Convert to the local timezone via libc so output matches `ls -l`
     // (respects the active timezone and DST through the system tz database).
-    var time_val: time_t = @intCast(epoch_secs);
     var tm_result: Tm = undefined;
-    if (localtime_r(&time_val, &tm_result) == null) return error.TimeConversionFailed;
+    try localTm(@intCast(epoch_secs), &tm_result);
 
     const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     const month_name = month_names[@intCast(tm_result.tm_mon)];
@@ -655,9 +679,8 @@ fn formatTime(allocator: std.mem.Allocator, mtime: i128) ![]const u8 {
 
 /// Wall-clock "HH:MM" for epoch seconds (local time).
 fn clockTime(buf: *[5]u8, epoch_secs: i64) ![]const u8 {
-    var time_val: time_t = @intCast(epoch_secs);
     var tm_result: Tm = undefined;
-    if (localtime_r(&time_val, &tm_result) == null) return error.TimeConversionFailed;
+    try localTm(@intCast(epoch_secs), &tm_result);
     return try std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{
         @as(u32, @intCast(tm_result.tm_hour)),
         @as(u32, @intCast(tm_result.tm_min)),
@@ -771,8 +794,18 @@ fn formatName(allocator: std.mem.Allocator, file: types.FileInfo, config: types.
 
 /// Format permissions as drwxr-xr-x (including file type).
 fn formatPermissions(allocator: std.mem.Allocator, file: types.FileInfo) ![]const u8 {
-    const S = std.posix.S;
-    const mode = file.mode;
+    // POSIX permission bits (same numeric values on all platforms here;
+    // on Windows the mode is synthesized from the readonly attribute).
+    const S_IRUSR: u32 = 0o400;
+    const S_IWUSR: u32 = 0o200;
+    const S_IXUSR: u32 = 0o100;
+    const S_IRGRP: u32 = 0o040;
+    const S_IWGRP: u32 = 0o020;
+    const S_IXGRP: u32 = 0o010;
+    const S_IROTH: u32 = 0o004;
+    const S_IWOTH: u32 = 0o002;
+    const S_IXOTH: u32 = 0o001;
+    const mode: u32 = file.mode;
 
     // Determine file type character
     const type_char: u8 = switch (file.kind) {
@@ -783,15 +816,15 @@ fn formatPermissions(allocator: std.mem.Allocator, file: types.FileInfo) ![]cons
 
     const perm = [_]u8{
         type_char,
-        if (mode & S.IRUSR != 0) 'r' else '-',
-        if (mode & S.IWUSR != 0) 'w' else '-',
-        if (mode & S.IXUSR != 0) 'x' else '-',
-        if (mode & S.IRGRP != 0) 'r' else '-',
-        if (mode & S.IWGRP != 0) 'w' else '-',
-        if (mode & S.IXGRP != 0) 'x' else '-',
-        if (mode & S.IROTH != 0) 'r' else '-',
-        if (mode & S.IWOTH != 0) 'w' else '-',
-        if (mode & S.IXOTH != 0) 'x' else '-',
+        if (mode & S_IRUSR != 0) 'r' else '-',
+        if (mode & S_IWUSR != 0) 'w' else '-',
+        if (mode & S_IXUSR != 0) 'x' else '-',
+        if (mode & S_IRGRP != 0) 'r' else '-',
+        if (mode & S_IWGRP != 0) 'w' else '-',
+        if (mode & S_IXGRP != 0) 'x' else '-',
+        if (mode & S_IROTH != 0) 'r' else '-',
+        if (mode & S_IWOTH != 0) 'w' else '-',
+        if (mode & S_IXOTH != 0) 'x' else '-',
     };
 
     return try std.fmt.allocPrint(allocator, "{s}", .{perm});
@@ -1172,8 +1205,13 @@ test "formatPermissions - file rw-r--r--" {
 // Pin the timezone to UTC so formatTime tests are deterministic regardless of
 // the machine running them. formatTime now renders in local time via libc.
 fn forceUtcTimezone() void {
-    _ = setenv("TZ", "UTC", 1);
-    tzset();
+    if (comptime builtin.os.tag == .windows) {
+        _ = _putenv_s("TZ", "UTC");
+        _tzset();
+    } else {
+        _ = setenv("TZ", "UTC", 1);
+        tzset();
+    }
 }
 
 test "formatTime - epoch zero" {
