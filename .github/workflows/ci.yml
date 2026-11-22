@@ -30,7 +30,11 @@ jobs:
           url="https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_target }}.${{ matrix.ext }}"
           curl -fSL "$url" -o "zig.${{ matrix.ext }}"
           python3 -c "import hashlib,sys; h=hashlib.sha256(open('zig.${{ matrix.ext }}','rb').read()).hexdigest(); sys.exit(0 if h == '${{ matrix.sha }}' else (print('sha256 mismatch:', h), 1)[1])"
-          tar -xf "zig.${{ matrix.ext }}"
+          if [[ "${{ matrix.ext }}" == "zip" ]]; then
+            python3 -c "import zipfile; zipfile.ZipFile('zig.${{ matrix.ext }}').extractall()"
+          else
+            tar -xf "zig.${{ matrix.ext }}"
+          fi
           mv "zig-${{ matrix.zig_target }}" zig
           echo "$PWD/zig" >> "$GITHUB_PATH"
 
@@ -77,7 +81,7 @@ jobs:
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-windows-${ZIG_VERSION}.zip"
             curl -fSL "$url" -o zig.zip
             python3 -c "import hashlib,sys; h=hashlib.sha256(open('zig.zip','rb').read()).hexdigest(); sys.exit(0 if h == 'b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e' else (print('sha256 mismatch:', h), 1)[1])"
-            tar -xf zig.zip
+            python3 -c "import zipfile; zipfile.ZipFile('zig.zip').extractall()"
             mv "zig-x86_64-windows-${ZIG_VERSION}" zig
           elif [ "${{ runner.os }}" = "macOS" ]; then
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
