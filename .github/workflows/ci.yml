@@ -29,7 +29,7 @@ jobs:
           set -euo pipefail
           url="https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_target }}.${{ matrix.ext }}"
           curl -fSL "$url" -o "zig.${{ matrix.ext }}"
-          echo "${{ matrix.sha }}  zig.${{ matrix.ext }}" | shasum -a 256 -c -
+          python3 -c "import hashlib,sys; h=hashlib.sha256(open('zig.${{ matrix.ext }}','rb').read()).hexdigest(); sys.exit(0 if h == '${{ matrix.sha }}' else (print('sha256 mismatch:', h), 1)[1])"
           tar -xf "zig.${{ matrix.ext }}"
           mv "zig-${{ matrix.zig_target }}" zig
           echo "$PWD/zig" >> "$GITHUB_PATH"
@@ -76,19 +76,19 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-windows-${ZIG_VERSION}.zip"
             curl -fSL "$url" -o zig.zip
-            echo "b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e  zig.zip" | shasum -a 256 -c -
+            python3 -c "import hashlib,sys; h=hashlib.sha256(open('zig.zip','rb').read()).hexdigest(); sys.exit(0 if h == 'b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e' else (print('sha256 mismatch:', h), 1)[1])"
             tar -xf zig.zip
             mv "zig-x86_64-windows-${ZIG_VERSION}" zig
           elif [ "${{ runner.os }}" = "macOS" ]; then
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
             curl -fSL "$url" -o zig.tar.xz
-            echo "75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d  zig.tar.xz" | shasum -a 256 -c -
+            python3 -c "import hashlib,sys; h=hashlib.sha256(open('zig.tar.xz','rb').read()).hexdigest(); sys.exit(0 if h == '75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d' else (print('sha256 mismatch:', h), 1)[1])"
             tar -xf zig.tar.xz
             mv "zig-aarch64-macos-${ZIG_VERSION}" zig
           else
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
             curl -fSL "$url" -o zig.tar.xz
-            echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  zig.tar.xz" | shasum -a 256 -c -
+            python3 -c "import hashlib,sys; h=hashlib.sha256(open('zig.tar.xz','rb').read()).hexdigest(); sys.exit(0 if h == '3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a' else (print('sha256 mismatch:', h), 1)[1])"
             tar -xf zig.tar.xz
             mv "zig-x86_64-linux-${ZIG_VERSION}" zig
           fi
@@ -113,7 +113,7 @@ jobs:
           else
             tar -czf "$artifact" -C pkg .
           fi
-          shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          python3 -c "import hashlib; print(hashlib.sha256(open('${{ matrix.artifact }}','rb').read()).hexdigest() + '  ${{ matrix.artifact }}')" > "${{ matrix.artifact }}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
